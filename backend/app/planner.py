@@ -26,10 +26,41 @@ def spent_minutes(s: Session, task_id: int) -> int:
     return int(v or 0)
 
 
+def _factors(s: Session) -> dict[str, Any]:
+    """Learned estimation bias, cached for the lifetime of the DB session."""
+    if "est_factors" not in s.info:
+        from . import insights
+
+        s.info["est_factors"] = insights.estimation_factors(s)
+    return s.info["est_factors"]
+
+
+def _parents_with_open_children(s: Session) -> set[int]:
+    if "open_parents" not in s.info:
+        rows = s.query(Task.parent_id).filter(Task.parent_id.is_not(None), Task.status.in_(["todo", "doing"])).all()
+        s.info["open_parents"] = {r[0] for r in rows}
+    return s.info["open_parents"]
+
+
+def invalidate(s: Session) -> None:
+    s.info.pop("est_factors", None)
+    s.info.pop("open_parents", None)
+
+
+def adjusted_estimate(s: Session, task: Task, default_minutes: int | None = None) -> int:
+    from . import insights
+
+    est = task.estimated_minutes or default_minutes or int(prefs.get("default_task_minutes", s=s))
+    return int(round(est * insights.factor_for(task, _factors(s))))
+
+
 def remaining_minutes(s: Session, task: Task, default_minutes: int | None = None) -> int:
     if task.status in ("done", "cancelled"):
         return 0
-    est = task.estimated_minutes or default_minutes or int(prefs.get("default_task_minutes", s=s))
+    if task.id in _parents_with_open_children(s):
+        children = s.query(Task).filter(Task.parent_id == task.id, Task.status.in_(["todo", "doing"])).all()
+        return sum(remaining_minutes(s, c, default_minutes) for c in children)
+    est = adjusted_estimate(s, task, default_minutes)
     spent = spent_minutes(s, task.id)
     options = [est - spent]
     if task.progress:
@@ -42,8 +73,23 @@ def open_tasks(s: Session) -> list[Task]:
     return s.query(Task).filter(Task.status.in_(["todo", "doing"])).all()
 
 
+def schedulable_tasks(s: Session) -> list[Task]:
+    """Open tasks the planner works on: leaf tasks (a project with open subtasks is planned via its subtasks)."""
+    parents = _parents_with_open_children(s)
+    tasks = [t for t in open_tasks(s) if t.id not in parents]
+    by_id = {t.id: t for t in s.query(Task).filter(Task.id.in_({t.parent_id for t in tasks if t.parent_id})).all()}
+    for t in tasks:  # subtasks without their own deadline inherit the project's
+        if t.due_at is None and t.parent_id and by_id.get(t.parent_id) is not None:
+            t.__dict__["_effective_due"] = by_id[t.parent_id].due_at
+    return tasks
+
+
+def effective_due(t: Task) -> datetime | None:
+    return t.due_at or t.__dict__.get("_effective_due")
+
+
 def _task_key(t: Task) -> tuple:
-    return (t.due_at or FAR_FUTURE, t.priority, t.id)
+    return (effective_due(t) or FAR_FUTURE, t.priority, t.id)
 
 
 # ---------------------------------------------------------------- intervals
@@ -154,8 +200,8 @@ class Feasibility:
 
 def feasibility(s: Session, extra_busy: list[Interval] | None = None, start: datetime | None = None) -> Feasibility:
     now = round_up(start or timeutil.now())
-    tasks = sorted([t for t in open_tasks(s) if t.due_at], key=_task_key)
-    horizon = max([t.due_at for t in tasks], default=now) + timedelta(days=1)
+    tasks = sorted([t for t in schedulable_tasks(s) if effective_due(t)], key=_task_key)
+    horizon = max([effective_due(t) for t in tasks], default=now) + timedelta(days=1)
     horizon = max(horizon, now + timedelta(days=7))
     days = free_days(s, now, horizon, extra_busy)
     res = Feasibility(capacity_7d=capacity_until(days, now + timedelta(days=7)))
@@ -163,12 +209,14 @@ def feasibility(s: Session, extra_busy: list[Interval] | None = None, start: dat
     for t in tasks:
         rem = remaining_minutes(s, t)
         cumulative += rem
-        cap = capacity_until(days, t.due_at)
+        cap = capacity_until(days, effective_due(t))
         slack = cap - cumulative
         info = {
             "task_id": t.id,
             "title": t.title,
-            "due": timeutil.iso(t.due_at),
+            "category": t.category,
+            "priority": t.priority,
+            "due": timeutil.iso(effective_due(t)),
             "remaining_minutes": rem,
             "slack_minutes": slack,
         }
@@ -176,7 +224,7 @@ def feasibility(s: Session, extra_busy: list[Interval] | None = None, start: dat
         res.min_slack = slack if res.min_slack is None else min(res.min_slack, slack)
         if slack < 0:
             res.at_risk.append(info)
-    res.total_required = sum(remaining_minutes(s, t) for t in open_tasks(s))
+    res.total_required = sum(remaining_minutes(s, t) for t in schedulable_tasks(s))
     return res
 
 
@@ -196,11 +244,29 @@ def plan(s: Session, days: int = 7, start: datetime | None = None, commit: bool 
     if commit:
         # replan: drop future, untouched blocks; keep ones in progress, imminent or already reported on
         s.query(PlannedBlock).filter(
-            PlannedBlock.start_at > now + timedelta(minutes=10), PlannedBlock.status == "planned"
+            PlannedBlock.start_at > now + timedelta(minutes=10),
+            PlannedBlock.status == "planned",
+            PlannedBlock.locked.is_(False),
         ).delete()
         s.flush()
 
-    tasks = sorted(open_tasks(s), key=_task_key)
+    from . import insights
+
+    invalidate(s)
+    peaks = set(insights.peak_hours(s)["hours"])
+    ws_h, we_h = timeutil.parse_time(p["work_start"]).hour, timeutil.parse_time(p["work_end"]).hour
+    window = set(range(ws_h, we_h)) if we_h > ws_h else set(range(ws_h, 24)) | set(range(0, we_h))
+    if not peaks & window:
+        peaks = set()  # peaks outside the productive window can't be used: plain EDF
+    tasks = sorted(schedulable_tasks(s), key=_task_key)
+    if commit:
+        # blocks of tasks that became projects (have subtasks) or are no longer open
+        leaf_ids = {t.id for t in tasks}
+        for b in s.query(PlannedBlock).filter(PlannedBlock.end_at > now, PlannedBlock.status == "planned",
+                                              PlannedBlock.locked.is_(False)).all():
+            if b.task_id not in leaf_ids:
+                s.delete(b)
+        s.flush()
     remaining = {t.id: remaining_minutes(s, t) for t in tasks}
     # minutes already covered by blocks that are kept (in progress right now)
     for b in s.query(PlannedBlock).filter(PlannedBlock.end_at > now, PlannedBlock.status == "planned").all():
@@ -223,24 +289,29 @@ def plan(s: Session, days: int = 7, start: datetime | None = None, commit: bool 
                 room = _minutes(cursor, slot_end)
                 if room < 15:
                     break
-                chosen = None
+                candidates = []
                 for t in tasks:
                     if remaining[t.id] <= 0:
                         continue
-                    urgent = t.due_at is not None and t.due_at - cursor <= timedelta(hours=36)
+                    due = effective_due(t)
+                    urgent = due is not None and due - cursor <= timedelta(hours=36)
                     used_today = per_task_day.get((t.id, df.day), 0)
                     if not urgent and used_today >= 180:
                         continue
-                    if t.due_at is not None and t.due_at <= cursor and t.due_at >= now:
+                    if due is not None and due <= cursor and due >= now:
                         continue  # can't help this one anymore inside this slot
-                    chosen = t
+                    candidates.append(t)
+                if not candidates:
                     break
-                if chosen is None:
-                    break
+                chosen = _pick(candidates, cursor, peaks)
+                if chosen is None:  # only deep work left and this isn't a peak hour: keep it for later
+                    cursor = round_up(cursor + timedelta(minutes=15))
+                    continue
                 need = remaining[chosen.id]
                 length = min(focus, need, room, cap_left)
-                if chosen.due_at and chosen.due_at > cursor:
-                    length = min(length, _minutes(cursor, chosen.due_at))
+                due = effective_due(chosen)
+                if due and due > cursor:
+                    length = min(length, _minutes(cursor, due))
                 if length < min_block and need > length:
                     # too short for a real block of a bigger task; skip rest of this slot
                     break
@@ -262,17 +333,22 @@ def plan(s: Session, days: int = 7, start: datetime | None = None, commit: bool 
     unscheduled, warnings = [], []
     for t in tasks:
         if remaining[t.id] > 0:
-            unscheduled.append({"task_id": t.id, "title": t.title, "minutes": remaining[t.id], "due": timeutil.iso(t.due_at)})
+            unscheduled.append({"task_id": t.id, "title": t.title, "minutes": remaining[t.id],
+                                "due": timeutil.iso(effective_due(t))})
+    kept = s.query(PlannedBlock).filter(PlannedBlock.end_at > now, PlannedBlock.status == "planned").all()
     for t in tasks:
-        if not t.due_at:
+        due = effective_due(t)
+        if not due:
             continue
         before_due = sum(
-            _minutes(b.start_at, b.end_at) for b in new_blocks if b.task_id == t.id and b.end_at <= t.due_at
+            _minutes(max(b.start_at, now), b.end_at)
+            for b in [*new_blocks, *kept]
+            if b.task_id == t.id and b.end_at <= due
         )
         need = remaining_minutes(s, t)
-        if before_due < need and t.due_at <= horizon:
+        if before_due < need and due <= horizon:
             warnings.append(
-                f"«{t.title}» تا ددلاین ({timeutil.fa_datetime(t.due_at)}) فقط {timeutil.fa_duration(before_due)} "
+                f"«{t.title}» تا ددلاین ({timeutil.fa_datetime(due)}) فقط {timeutil.fa_duration(before_due)} "
                 f"از {timeutil.fa_duration(need)} جا می‌شود."
             )
 
@@ -288,6 +364,44 @@ def plan(s: Session, days: int = 7, start: datetime | None = None, commit: bool 
         for b in new_blocks
     ]
     return PlanResult(blocks=blocks_out, unscheduled=unscheduled, warnings=warnings)
+
+
+def _pick(candidates: list[Task], cursor: datetime, peaks: set[int]) -> Task | None:
+    """EDF, but match deep work to the user's peak hours when the deadline allows it.
+
+    Returns None when only non-urgent deep work is left outside peak hours (the slot is left free).
+    """
+    first = candidates[0]
+    due = effective_due(first)
+    if not peaks or (due is not None and due - cursor <= timedelta(hours=36)):
+        return first  # no learned peaks, or urgent: deadline order wins
+    in_peak = cursor.hour in peaks
+    for t in candidates[:4]:
+        if in_peak and t.energy == "high":
+            return t
+        if not in_peak and t.energy != "high":
+            return t
+    if not in_peak and all(t.energy == "high" for t in candidates):
+        return None
+    return first
+
+
+def sweep_missed(s: Session, now: datetime | None = None) -> int:
+    """Past blocks nobody worked in become 'skipped' (feeds stats and triggers a re-plan)."""
+    now = now or timeutil.now()
+    n = 0
+    for b in s.query(PlannedBlock).filter(PlannedBlock.status == "planned",
+                                          PlannedBlock.end_at < now - timedelta(hours=2)).all():
+        worked = (
+            s.query(WorkLog)
+            .filter(WorkLog.task_id == b.task_id, WorkLog.start_at < b.end_at,
+                    (WorkLog.end_at.is_(None)) | (WorkLog.end_at > b.start_at))
+            .count()
+        )
+        b.status = "done" if worked else "skipped"
+        n += 0 if worked else 1
+    s.flush()
+    return n
 
 
 # ---------------------------------------------------------------- availability
@@ -331,10 +445,11 @@ def check_availability(
 
     # due soon after the outing: things that will feel the squeeze
     due_soon = []
-    for t in open_tasks(s):
-        if t.due_at and win[0] - timedelta(hours=12) <= t.due_at <= win[1] + timedelta(hours=36):
+    for t in schedulable_tasks(s):
+        due = effective_due(t)
+        if due and win[0] - timedelta(hours=12) <= due <= win[1] + timedelta(hours=36):
             due_soon.append(
-                {"task_id": t.id, "title": t.title, "due": timeutil.iso(t.due_at), "remaining_minutes": remaining_minutes(s, t)}
+                {"task_id": t.id, "title": t.title, "due": timeutil.iso(due), "remaining_minutes": remaining_minutes(s, t)}
             )
 
     lost = capacity_until(free_days(s, now, win[1] + timedelta(days=1)), win[1] + timedelta(days=1)) - capacity_until(

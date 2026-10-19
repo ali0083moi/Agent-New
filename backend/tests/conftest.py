@@ -12,6 +12,7 @@ os.environ.setdefault("GAPGPT_API_KEY", "test-key")
 os.environ["TELEGRAM_BOT_TOKEN"] = ""
 os.environ["TELEGRAM_CHAT_ID"] = ""
 os.environ["SCHEDULER_ENABLED"] = "false"
+os.environ["BACKGROUND_JOBS"] = "false"
 os.environ["APP_PASSWORD"] = ""
 
 from app import db, llm, timeutil  # noqa: E402
@@ -57,13 +58,21 @@ class FakeLLM:
         self.calls: list[dict] = []
         self.default = default
 
-    async def chat(self, messages, tools=None, model=None):
-        self.calls.append({"messages": messages, "tools": tools, "model": model})
+    def model(self, kind):
+        return {"chat": "fake-chat", "fast": "fake-fast", "vision": "fake-vision", "ielts": "fake-ielts"}[kind]
+
+    def budget(self):
+        return {"spent_today": 0.0, "limit": 0, "over": False}
+
+    async def chat(self, messages, tools=None, model=None, purpose="chat", on_delta=None):
+        self.calls.append({"messages": messages, "tools": tools, "model": model, "purpose": purpose})
         if self.script:
             step = self.script.pop(0)
             res = step(messages, tools) if callable(step) else step
         else:
             res = ChatResult(content=self.default)
+        if on_delta is not None and res.content and not res.tool_calls:
+            await on_delta(res.content)
         if res.tool_calls and not res.raw_message:
             res.raw_message = {
                 "role": "assistant",
@@ -75,14 +84,24 @@ class FakeLLM:
             }
         return res
 
-    async def complete(self, system, user, model=None):
-        res = await self.chat([{"role": "system", "content": system}, {"role": "user", "content": user}], model=model)
+    async def complete(self, system, user, model=None, purpose="compose"):
+        res = await self.chat([{"role": "system", "content": system}, {"role": "user", "content": user}], model=model,
+                              purpose=purpose)
         return res.content
+
+    async def embed(self, texts):
+        from app.llm import LLMError
+
+        raise LLMError("no embeddings in tests")
+
+    async def speak(self, text, fmt="opus"):
+        return b"OggS"
 
     async def vision(self, image, mime, prompt, model=None):
         return "این یک برنامه کلاسی است."
 
-    async def transcribe(self, audio, filename):
+    async def transcribe(self, audio, filename, language="fa"):
+        self.last_language = language
         return "فردا ساعت ده کلاس دارم"
 
 

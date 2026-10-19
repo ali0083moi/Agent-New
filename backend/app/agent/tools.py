@@ -11,7 +11,7 @@ from typing import Any, Callable
 
 from sqlalchemy.orm import Session
 
-from .. import cal, followups, planner, prefs, serialize, stats, timeutil
+from .. import cal, followups, journal, planner, prefs, serialize, stats, timeutil
 from ..db import Event, Followup, Goal, Memory, PlannedBlock, RecurringEvent, Task, WorkLog, session
 
 log = logging.getLogger(__name__)
@@ -26,6 +26,13 @@ DT_HELP = "Local datetime 'YYYY-MM-DD HH:MM'. Gregorian, or Jalali if year<1700 
 class Ctx:
     channel: str = "web"
     changed: set[str] = field(default_factory=set)
+    turn_id: str | None = None  # groups this turn's changes for undo
+    trusted: bool = False  # explicit action in the web UI (skips the delete confirmation)
+    replan: bool = False
+
+
+# tools after which the plan doesn't need to be refreshed
+NO_REPLAN = {"plan_schedule", "start_focus"}
 
 
 @dataclass
@@ -82,7 +89,11 @@ async def execute(name: str, raw_args: str | dict[str, Any], ctx: Ctx) -> dict[s
         else:
             with session() as s:
                 result = spec.fn(s, ctx=ctx, **args)
+        if isinstance(result, dict) and result.get("needs_confirmation"):
+            return result
         ctx.changed.update(spec.changes)
+        if "tasks" in spec.changes and name not in NO_REPLAN:
+            ctx.replan = True
         return result if isinstance(result, dict) else {"result": result}
     except TypeError as e:
         log.warning("tool %s bad args: %s", name, e)
@@ -90,6 +101,20 @@ async def execute(name: str, raw_args: str | dict[str, Any], ctx: Ctx) -> dict[s
     except Exception as e:  # noqa: BLE001
         log.exception("tool %s failed", name)
         return {"error": str(e)}
+
+
+def finalize(ctx: Ctx) -> None:
+    """End of a turn / API call: refresh the plan once if tasks changed."""
+    if not ctx.replan:
+        return
+    ctx.replan = False
+    try:
+        with session() as s:
+            if prefs.get("auto_replan", True, s=s) and planner.open_tasks(s):
+                planner.plan(s, days=7)
+                ctx.changed.update({"schedule", "followups"})
+    except Exception:  # noqa: BLE001
+        log.exception("auto re-plan failed")
 
 
 # ------------------------------------------------------------------ helpers
@@ -181,6 +206,9 @@ def list_tasks(s: Session, ctx: Ctx, status: str = "open", category: str | None 
         "priority": {"type": "integer", "enum": [1, 2, 3], "description": "1 high, 2 normal, 3 low"},
         "recurring_event_id": {"type": "integer", "description": "Related class id, if any."},
         "goal_id": {"type": "integer"},
+        "energy": {"type": "string", "enum": ["high", "normal", "low"],
+                   "description": "high = deep/hard work (essays, projects, studying), low = easy admin/errands"},
+        "parent_id": {"type": "integer", "description": "Parent task (makes this a subtask / milestone)."},
     },
     ["title"],
     changes=("tasks", "followups"),
@@ -197,8 +225,15 @@ def add_task(
     priority: int = 2,
     recurring_event_id: int | None = None,
     goal_id: int | None = None,
+    energy: str = "normal",
+    parent_id: int | None = None,
 ):
     due_at = timeutil.parse_datetime(due) if due else None
+    parent = _get(s, Task, parent_id, "تسک والد") if parent_id else None
+    if parent is not None:
+        category = category or parent.category
+        recurring_event_id = recurring_event_id or parent.recurring_event_id
+        goal_id = goal_id or parent.goal_id
     rec = None
     if due_next_session_of:
         rec = _get(s, RecurringEvent, due_next_session_of, "کلاس")
@@ -221,10 +256,14 @@ def add_task(
         priority=int(priority or 2),
         recurring_event_id=recurring_event_id,
         goal_id=goal_id,
+        energy=energy if energy in ("high", "normal", "low") else "normal",
+        parent_id=parent.id if parent else None,
         source=ctx.channel,
     )
     s.add(t)
     s.flush()
+    journal.created(s, ctx, t, f"تسک «{t.title}»")
+    planner.invalidate(s)
     planned = followups.ensure_task_followups(s, t, prefs.all_prefs(s), timeutil.now())
     return {
         "task": serialize.task(s, t),
@@ -246,13 +285,15 @@ def add_task(
         "status": {"type": "string", "enum": ["todo", "doing", "done", "cancelled"]},
         "progress": {"type": "integer", "description": "percent 0-100"},
         "add_note": {"type": "string"},
+        "energy": {"type": "string", "enum": ["high", "normal", "low"]},
     },
     ["task_id"],
     changes=("tasks", "followups", "schedule"),
 )
 def update_task(s: Session, ctx: Ctx, task_id: int, **fields):
     t = _get(s, Task, task_id, "تسک")
-    for key in ("title", "description", "estimated_minutes", "priority"):
+    journal.before_update(s, ctx, t, f"ویرایش «{t.title}»")
+    for key in ("title", "description", "estimated_minutes", "priority", "energy"):
         if key in fields:
             setattr(t, key, fields[key])
     if "category" in fields:
@@ -265,14 +306,14 @@ def update_task(s: Session, ctx: Ctx, task_id: int, **fields):
         stamp = timeutil.fa_datetime(timeutil.now())
         t.notes = (t.notes + "\n" if t.notes else "") + f"[{stamp}] {fields['add_note']}"
     if "status" in fields:
-        _set_status(s, t, fields["status"])
+        _set_status(s, t, fields["status"], ctx)
     s.flush()
     if t.status in ("todo", "doing"):
         followups.ensure_task_followups(s, t, prefs.all_prefs(s), timeutil.now())
     return {"task": serialize.task(s, t)}
 
 
-def _set_status(s: Session, t: Task, status: str) -> None:
+def _set_status(s: Session, t: Task, status: str, ctx: Ctx | None = None) -> None:
     t.status = status
     if status == "done":
         t.completed_at = timeutil.now()
@@ -284,6 +325,28 @@ def _set_status(s: Session, t: Task, status: str) -> None:
         ).delete()
     else:
         t.completed_at = None
+    s.flush()
+    planner.invalidate(s)
+    if t.parent_id:
+        _sync_parent(s, t.parent_id, ctx)
+
+
+def _sync_parent(s: Session, parent_id: int, ctx: Ctx | None) -> None:
+    """A project's progress follows its subtasks; it completes when all of them are done."""
+    parent = s.get(Task, parent_id)
+    if parent is None:
+        return
+    kids = s.query(Task).filter(Task.parent_id == parent.id, Task.status != "cancelled").all()
+    if not kids:
+        return
+    done = sum(1 for k in kids if k.status == "done")
+    if ctx is not None:
+        journal.before_update(s, ctx, parent, f"پیشرفت «{parent.title}»")
+    parent.progress = round(100 * done / len(kids))
+    if done == len(kids) and parent.status != "done":
+        _set_status(s, parent, "done", ctx)
+    elif done < len(kids) and parent.status == "done":
+        parent.status, parent.completed_at = "doing", None
 
 
 @tool(
@@ -299,30 +362,40 @@ def _set_status(s: Session, t: Task, status: str) -> None:
 )
 def complete_task(s: Session, ctx: Ctx, task_id: int, spent_minutes: int | None = None, note: str | None = None):
     t = _get(s, Task, task_id, "تسک")
+    journal.before_update(s, ctx, t, f"انجام «{t.title}»")
     if spent_minutes:
         end = timeutil.now()
-        s.add(
-            WorkLog(
-                task_id=t.id,
-                description=note or t.title,
-                category=t.category,
-                start_at=end - timedelta(minutes=int(spent_minutes)),
-                end_at=end,
-                minutes=int(spent_minutes),
-                source="chat",
-            )
+        lg = WorkLog(
+            task_id=t.id,
+            description=note or t.title,
+            category=t.category,
+            start_at=end - timedelta(minutes=int(spent_minutes)),
+            end_at=end,
+            minutes=int(spent_minutes),
+            source="chat",
         )
+        s.add(lg)
+        journal.created(s, ctx, lg)
     if note:
         t.notes = (t.notes + "\n" if t.notes else "") + note
-    _set_status(s, t, "done")
+    _set_status(s, t, "done", ctx)
     s.flush()
     return {"task": serialize.task(s, t)}
 
 
-@tool("delete_task", "Delete a task permanently.", {"task_id": {"type": "integer"}}, ["task_id"],
-      changes=("tasks", "followups", "schedule"))
-def delete_task(s: Session, ctx: Ctx, task_id: int):
+_CONFIRM = {"type": "boolean", "description": "true only after the user confirmed in a previous message"}
+
+
+@tool("delete_task", "Delete a task permanently (asks for confirmation first). Prefer status=cancelled.",
+      {"task_id": {"type": "integer"}, "confirmed": _CONFIRM}, ["task_id"], changes=("tasks", "followups", "schedule"))
+def delete_task(s: Session, ctx: Ctx, task_id: int, confirmed: bool = False):
     t = _get(s, Task, task_id, "تسک")
+    guard = journal.confirm_guard(ctx, f"task:{t.id}", f"تسک «{t.title}»", confirmed)
+    if guard:
+        return guard
+    for child in s.query(Task).filter(Task.parent_id == t.id).all():
+        journal.before_delete(s, ctx, child)
+    journal.before_delete(s, ctx, t, f"حذف «{t.title}»")
     s.delete(t)
     return {"deleted": task_id}
 
@@ -391,6 +464,7 @@ def add_recurring_events(s: Session, ctx: Ctx, events: list[dict[str, Any]]):
             raise ValueError(f"روزهای هفته برای «{r.title}» مشخص نیست")
         s.add(r)
         s.flush()
+        journal.created(s, ctx, r, f"کلاس «{r.title}»")
         created.append(serialize.recurring(r))
     return {"created": created}
 
@@ -404,6 +478,7 @@ def add_recurring_events(s: Session, ctx: Ctx, events: list[dict[str, Any]]):
 )
 def update_recurring_event(s: Session, ctx: Ctx, recurring_event_id: int, **data):
     r = _get(s, RecurringEvent, recurring_event_id, "کلاس")
+    journal.before_update(s, ctx, r, f"ویرایش کلاس «{r.title}»")
     _apply_rec(r, data)
     if "active" in data:
         r.active = bool(data["active"])
@@ -411,10 +486,15 @@ def update_recurring_event(s: Session, ctx: Ctx, recurring_event_id: int, **data
     return {"recurring_event": serialize.recurring(r)}
 
 
-@tool("delete_recurring_event", "Delete a recurring class/commitment.", {"recurring_event_id": {"type": "integer"}},
+@tool("delete_recurring_event", "Delete a recurring class/commitment (asks for confirmation first).",
+      {"recurring_event_id": {"type": "integer"}, "confirmed": _CONFIRM},
       ["recurring_event_id"], changes=("schedule", "followups"))
-def delete_recurring_event(s: Session, ctx: Ctx, recurring_event_id: int):
+def delete_recurring_event(s: Session, ctx: Ctx, recurring_event_id: int, confirmed: bool = False):
     r = _get(s, RecurringEvent, recurring_event_id, "کلاس")
+    guard = journal.confirm_guard(ctx, f"recurring:{r.id}", f"کلاس «{r.title}»", confirmed)
+    if guard:
+        return guard
+    journal.before_delete(s, ctx, r, f"حذف کلاس «{r.title}»")
     s.delete(r)
     return {"deleted": recurring_event_id}
 
@@ -448,6 +528,7 @@ def add_event(s: Session, ctx: Ctx, title: str, start: str, end: str | None = No
                location=location, notes=notes)
     s.add(ev)
     s.flush()
+    journal.created(s, ctx, ev, f"رویداد «{ev.title}»")
     clash = [
         {"title": t, "start": timeutil.iso(a), "end": timeutil.iso(b)}
         for a, b, t in cal.busy_intervals(s, st, en, class_buffer=0, exclude_event_ids={ev.id})
@@ -472,6 +553,7 @@ def add_event(s: Session, ctx: Ctx, title: str, start: str, end: str | None = No
 )
 def update_event(s: Session, ctx: Ctx, event_id: int, **data):
     ev = _get(s, Event, event_id, "رویداد")
+    journal.before_update(s, ctx, ev, f"ویرایش «{ev.title}»")
     duration = ev.end_at - ev.start_at
     if "start" in data:
         ev.start_at = timeutil.parse_datetime(data["start"])
@@ -486,9 +568,15 @@ def update_event(s: Session, ctx: Ctx, event_id: int, **data):
     return {"event": serialize.event(ev)}
 
 
-@tool("delete_event", "Delete a one-off event.", {"event_id": {"type": "integer"}}, ["event_id"], changes=("schedule",))
-def delete_event(s: Session, ctx: Ctx, event_id: int):
-    s.delete(_get(s, Event, event_id, "رویداد"))
+@tool("delete_event", "Delete a one-off event (asks for confirmation first).",
+      {"event_id": {"type": "integer"}, "confirmed": _CONFIRM}, ["event_id"], changes=("schedule",))
+def delete_event(s: Session, ctx: Ctx, event_id: int, confirmed: bool = False):
+    ev = _get(s, Event, event_id, "رویداد")
+    guard = journal.confirm_guard(ctx, f"event:{ev.id}", f"رویداد «{ev.title}»", confirmed)
+    if guard:
+        return guard
+    journal.before_delete(s, ctx, ev, f"حذف «{ev.title}»")
+    s.delete(ev)
     return {"deleted": event_id}
 
 
@@ -564,7 +652,9 @@ def log_work(s: Session, ctx: Ctx, description: str, minutes: int | None = None,
                      category=_cat(category, t.category if t else "personal"),
                      start_at=st, end_at=en, minutes=mins, productive=bool(productive), source="chat")
         s.add(lg)
+        journal.created(s, ctx, lg, f"ثبت {timeutil.fa_duration(mins)}")
     if t is not None:
+        journal.before_update(s, ctx, t)
         if progress is not None:
             t.progress = max(0, min(100, int(progress)))
         if t.status == "todo":
@@ -572,6 +662,7 @@ def log_work(s: Session, ctx: Ctx, description: str, minutes: int | None = None,
     if block_id:
         b = s.get(PlannedBlock, int(block_id))
         if b:
+            journal.before_update(s, ctx, b)
             b.status = block_status or "done"
     s.flush()
     return {"logged_minutes": mins, "task": serialize.task(s, t) if t else None,
@@ -589,15 +680,18 @@ def start_focus(s: Session, ctx: Ctx, task_id: int | None = None, description: s
     closed = None
     cur = stats.active_focus(s)
     if cur is not None:
+        journal.before_update(s, ctx, cur)
         closed = stats.close_focus(s, cur)
     t = _get(s, Task, task_id, "تسک") if task_id else None
     if t and t.status == "todo":
+        journal.before_update(s, ctx, t)
         t.status = "doing"
     lg = WorkLog(task_id=t.id if t else None, description=description or (t.title if t else "کار"),
                  category=_cat(category, t.category if t else "personal"), start_at=timeutil.now(),
                  end_at=None, source="focus")
     s.add(lg)
     s.flush()
+    journal.created(s, ctx, lg, "تایمر تمرکز")
     return {"focus": stats.focus_to_dict(s, lg), "previous_session_closed_minutes": closed}
 
 
@@ -613,18 +707,21 @@ def stop_focus(s: Session, ctx: Ctx, note: str | None = None, progress: int | No
     cur = stats.active_focus(s)
     if cur is None:
         return {"error": "تایمر فعالی وجود ندارد"}
+    journal.before_update(s, ctx, cur, "توقف تایمر")
     minutes = stats.close_focus(s, cur, productive=productive)
     if note:
         cur.description = f"{cur.description} — {note}" if cur.description else note
     t = s.get(Task, cur.task_id) if cur.task_id else None
     if t is not None:
+        journal.before_update(s, ctx, t)
         if progress is not None:
             t.progress = max(0, min(100, int(progress)))
         if task_done:
-            _set_status(s, t, "done")
+            _set_status(s, t, "done", ctx)
         # mark overlapping planned block
         for b in s.query(PlannedBlock).filter(PlannedBlock.task_id == t.id, PlannedBlock.status == "planned",
                                               PlannedBlock.start_at < cur.end_at, PlannedBlock.end_at > cur.start_at):
+            journal.before_update(s, ctx, b)
             b.status = "done"
     s.flush()
     return {"logged_minutes": minutes, "task": serialize.task(s, t) if t else None,
@@ -681,6 +778,7 @@ def schedule_followup(s: Session, ctx: Ctx, at: str, note: str, task_id: int | N
     f = Followup(kind="custom", due_at=due, note=note, task_id=task_id, created_by="agent")
     s.add(f)
     s.flush()
+    journal.created(s, ctx, f, f"یادآوری «{note[:40]}»")
     return {"followup": serialize.followup(f)}
 
 
@@ -696,6 +794,7 @@ def list_followups(s: Session, ctx: Ctx, limit: int = 20):
       ["followup_id"], changes=("followups",))
 def cancel_followup(s: Session, ctx: Ctx, followup_id: int):
     f = _get(s, Followup, followup_id, "یادآوری")
+    journal.before_update(s, ctx, f, "لغو یادآوری")
     f.status = "cancelled"
     return {"cancelled": followup_id}
 
@@ -710,16 +809,19 @@ def cancel_followup(s: Session, ctx: Ctx, followup_id: int):
     changes=("memories",),
 )
 def remember(s: Session, ctx: Ctx, content: str, category: str = "fact"):
-    m = Memory(content=content.strip(), category=category)
+    m = Memory(content=content.strip(), category=category, source="agent")
     s.add(m)
     s.flush()
+    journal.created(s, ctx, m, "حافظه")
     return {"memory": serialize.memory(m)}
 
 
-@tool("forget", "Delete a saved memory that is wrong or outdated.", {"memory_id": {"type": "integer"}},
-      ["memory_id"], changes=("memories",))
+@tool("forget", "Delete a saved memory that is wrong or outdated (no confirmation needed when the user asked).",
+      {"memory_id": {"type": "integer"}}, ["memory_id"], changes=("memories",))
 def forget(s: Session, ctx: Ctx, memory_id: int):
-    s.delete(_get(s, Memory, memory_id, "حافظه"))
+    m = _get(s, Memory, memory_id, "حافظه")
+    journal.before_delete(s, ctx, m, "فراموشی")
+    s.delete(m)
     return {"deleted": memory_id}
 
 
@@ -737,6 +839,7 @@ def add_goal(s: Session, ctx: Ctx, title: str, description: str = "", category: 
              target_date=timeutil.parse_date(target_date) if target_date else None)
     s.add(g)
     s.flush()
+    journal.created(s, ctx, g, f"هدف «{g.title}»")
     return {"goal": serialize.goal(g)}
 
 
@@ -751,6 +854,7 @@ def add_goal(s: Session, ctx: Ctx, title: str, description: str = "", category: 
 )
 def update_goal(s: Session, ctx: Ctx, goal_id: int, **data):
     g = _get(s, Goal, goal_id, "هدف")
+    journal.before_update(s, ctx, g, f"هدف «{g.title}»")
     for key in ("title", "description", "status", "progress_note"):
         if key in data:
             setattr(g, key, data[key])
@@ -783,7 +887,11 @@ async def weekly_report(ctx: Ctx, week_offset: int = 0):
     "(sat..fri), weekly_report_time, followup_intensity (low|normal|high), idle_checkin_hours, "
     "post_class_delay_minutes, block_nudges, auto_plan_daily, focus_block_minutes, break_minutes, "
     "max_focus_minutes_per_day, daily_focus_goal_minutes, class_buffer_minutes, default_task_minutes, "
-    "semester_start (YYYY-MM-DD), employer_name, work_report_categories (list), mirror_web_to_telegram. "
+    "semester_start (YYYY-MM-DD), employer_name, work_report_categories (list), mirror_web_to_telegram, "
+    "voice_replies (off|when_voice|always), auto_replan, rescue_mode, weekly_planning_day, weekly_planning_time, "
+    "ielts_target_band, ielts_exam_date, vocab_review_time, vocab_daily_count, daily_budget_usd, "
+    "adaptive_reminders, semantic_memory, auto_facts, llm_chat_model / llm_fast_model / llm_vision_model / "
+    "llm_ielts_model (override AI models; '' = default). "
     "Special key current_week_parity ('odd'|'even') tells which university week (فرد/زوج) the current week is.",
     {"changes": {"type": "object", "description": "key -> new value"}},
     ["changes"],
@@ -796,6 +904,7 @@ def update_preferences(s: Session, ctx: Ctx, changes: dict[str, Any]):
             ws = timeutil.week_start(timeutil.today())
             # week 1 is odd: if the current week is odd, the semester "starts" now, else one week earlier
             start = ws if value == "odd" else ws - timedelta(days=7)
+            journal.pref_change(s, ctx, "semester_start", prefs.get("semester_start", s=s))
             prefs.set("semester_start", start.isoformat(), s=s)
             applied["semester_start"] = start.isoformat()
             continue
@@ -803,10 +912,14 @@ def update_preferences(s: Session, ctx: Ctx, changes: dict[str, Any]):
             raise ValueError(f"تنظیم ناشناخته: {key}")
         if key.endswith("_time") or key in ("work_start", "work_end"):
             value = timeutil.parse_time(value).strftime("%H:%M")
-        if key == "weekly_report_day":
+        if key in ("weekly_report_day", "weekly_planning_day"):
             value = timeutil.normalize_weekday(value)
-        if key == "semester_start" and value:
+        if key in ("semester_start", "ielts_exam_date") and value:
             value = timeutil.parse_date(value).isoformat()
+        journal.pref_change(s, ctx, key, prefs.get(key, s=s))
         prefs.set(key, value, s=s)
         applied[key] = value
     return {"applied": applied}
+
+
+from . import tools_more  # noqa: E402,F401  (registers the remaining tools)

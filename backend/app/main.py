@@ -22,15 +22,22 @@ log = logging.getLogger("peygir")
 async def scheduler_loop() -> None:
     from .agent import proactive
 
+    from . import jobs, memory
+
     interval = get_settings().scheduler_interval_seconds
     await asyncio.sleep(3)
+    n = 0
     while True:
         try:
             await proactive.tick()
+            if n % 20 == 0:  # every ~10 minutes: catch up on memory indexing and summaries
+                jobs.spawn("index", memory.index_pending)
+                jobs.spawn("summary", memory.summarize_old)
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001
             log.exception("scheduler tick failed")
+        n += 1
         await asyncio.sleep(interval)
 
 

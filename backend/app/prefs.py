@@ -35,10 +35,31 @@ DEFAULTS: dict[str, Any] = {
     "default_task_minutes": 60,
     "daily_focus_goal_minutes": 240,
     "semester_start": None,  # ISO date, used for odd/even week parity
-    # sync & reports
+    "auto_replan": True,  # re-plan when tasks change or a block is skipped
+    "rescue_mode": True,  # proactive "you're falling behind" help
+    "weekly_planning_day": "fri",
+    "weekly_planning_time": "17:00",
+    # learning & memory
+    "semantic_memory": True,
+    "auto_facts": True,
+    "adaptive_reminders": True,
+    # IELTS coach
+    "ielts_target_band": 7.0,
+    "ielts_exam_date": None,
+    "vocab_review_time": "13:00",
+    "vocab_daily_count": 8,
+    # sync, notifications & reports
     "mirror_web_to_telegram": True,
+    "voice_replies": "when_voice",  # off | when_voice | always
+    "push_enabled": True,
     "employer_name": "",
     "work_report_categories": ["work"],
+    # AI cost control & model overrides (empty = value from .env)
+    "daily_budget_usd": 0,  # 0 = unlimited
+    "llm_chat_model": "",
+    "llm_fast_model": "",
+    "llm_vision_model": "",
+    "llm_ielts_model": "",
 }
 
 # app state keys (not user preferences)

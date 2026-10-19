@@ -162,7 +162,7 @@ def test_block_nudges_and_focus(clock, fake_llm):
         followups.generate(s)
         kinds = sorted(f.kind for f in s.query(Followup).filter(Followup.block_id == b.id))
         assert kinds == ["block_end", "block_start"]
-        tid = t.id
+        tid, bid = t.id, b.id
     clock.value = datetime(2026, 10, 19, 11, 0)
     fake_llm.script = [ChatResult(content="وقت مطالعه‌ست! شروع کنیم؟")]
     run(proactive.tick())
@@ -180,7 +180,9 @@ def test_block_nudges_and_focus(clock, fake_llm):
         lg = s.query(WorkLog).one()
         assert lg.minutes == 70
         assert s.get(Task, tid).progress == 50
-        assert s.query(PlannedBlock).one().status == "done"
+        assert s.get(PlannedBlock, bid).status == "done"
+        # remaining work was re-planned automatically after the progress update
+        assert s.query(PlannedBlock).filter(PlannedBlock.status == "planned").count() >= 1
 
 
 def test_idle_checkin(clock, fake_llm):

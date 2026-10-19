@@ -70,8 +70,12 @@ def test_pairing_then_chat(bot, fake_llm):
 
     fake_llm.script = [call("add_task", title="تمرین ریاضی", due="2026-10-21 10:00"), ChatResult(content="✅ ثبت شد")]
     run(bot.handle({"message": {"chat": chat, "text": "تا چهارشنبه ده صبح باید تمرین ریاضی بدم"}}))
-    texts = [m.get("text") for m in bot.sent if m["method"] == "sendMessage"]
-    assert texts[-1] == "✅ ثبت شد"
+    # the reply streams into a placeholder message which is then edited into the final text
+    assert [m["text"] for m in bot.sent if m["method"] == "sendMessage"][-1] == "✍️ …"
+    final = [m for m in bot.sent if m["method"] == "editMessageText"][-1]
+    assert final["text"] == "✅ ثبت شد" and final["parse_mode"] == "HTML"
+    # the change can be undone with an inline button
+    assert final["reply_markup"]["inline_keyboard"][-1][0]["text"] == "↩️ برگردون"
     with session() as s:
         assert s.query(Task).one().title == "تمرین ریاضی"
         chans = [m.channel for m in s.query(Message).order_by(Message.id)]

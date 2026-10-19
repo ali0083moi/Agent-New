@@ -9,3 +9,6 @@ jdatetime>=5.0
 tzdata
 python-multipart>=0.0.9
 itsdangerous>=2.2
+numpy>=1.26
+pypdf>=4.0
+pywebpush>=2.0

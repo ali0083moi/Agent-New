@@ -7,14 +7,18 @@ from datetime import timedelta
 from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Request, Response, UploadFile
+from fastapi.responses import Response as RawResponse
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+from sqlalchemy import Integer
 
-from .. import cal, notify, planner, prefs, reports, serialize, stats, telegram, timeutil
+from .. import (actions, cal, gamify, habits, ielts, insights, notify, outbox, planner, prefs, push, reports,
+               serialize, stats, telegram, timeutil)
 from ..agent import core, tools
 from ..bus import bus
 from ..config import get_settings
-from ..db import Followup, Goal, Memory, Message, RecurringEvent, Report, Task, session
+from ..db import (Commitment, Followup, Goal, Habit, IeltsScore, LlmUsage, Memory, Message, PlannedBlock,
+                  RecurringEvent, Report, Task, VocabWord, WorkLog, session)
 from ..llm import LLMError, get_llm
 from . import auth
 
@@ -62,10 +66,12 @@ def me(request: Request):
 
 # ---------------------------------------------------------------- helpers
 async def _tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
-    ctx = tools.Ctx(channel="web")
+    # explicit clicks in the UI: the UI already asked for confirmation
+    ctx = tools.Ctx(channel="web", trusted=True)
     res = await tools.execute(name, args, ctx)
     if "error" in res:
         raise HTTPException(400, res["error"])
+    tools.finalize(ctx)
     if ctx.changed:
         bus.publish("data_changed", sorted(ctx.changed))
     return res
@@ -94,15 +100,47 @@ async def chat(
         if not data:
             continue
         mime = f.content_type or "application/octet-stream"
-        kind = "image" if mime.startswith("image/") else "audio" if mime.startswith(("audio/", "video/webm")) else None
+        name = (f.filename or "").lower()
+        kind = (
+            "image" if mime.startswith("image/")
+            else "audio" if mime.startswith(("audio/", "video/webm"))
+            else "document" if mime == "application/pdf" or mime.startswith("text/") or name.endswith((".pdf", ".txt", ".md", ".csv"))
+            else None
+        )
         if kind is None:
             raise HTTPException(400, f"نوع فایل پشتیبانی نمی‌شود: {mime}")
         attachments.append(core.Attachment(kind, data, mime, f.filename or ""))
     if not text.strip() and not attachments:
         raise HTTPException(400, "پیام خالی است")
     user_msg, reply = await core.handle_user_message(text, "web", attachments)
-    background.add_task(notify.mirror_web_turn, user_msg["content"] or "📎", reply["content"])
+    background.add_task(notify.mirror_web_turn, user_msg["content"] or "📎", reply)
     return {"user": user_msg, "assistant": reply}
+
+
+@router.post("/messages/{message_id}/undo")
+def undo_message(message_id: int):
+    return {"text": actions.undo_message(message_id)}
+
+
+@router.post("/messages/{message_id}/snooze")
+def snooze_message(message_id: int, minutes: int = 60):
+    return {"text": actions.snooze_message(message_id, minutes)}
+
+
+@router.get("/messages/{message_id}/tts")
+async def message_tts(message_id: int):
+    from ..llm import get_llm
+
+    with session() as s:
+        m = s.get(Message, message_id)
+        if m is None:
+            raise HTTPException(404, "not found")
+        text = notify.plain_text(m.content)[:2000]
+    try:
+        audio = await get_llm().speak(text, fmt="mp3")
+    except LLMError as e:
+        raise HTTPException(502, str(e)) from e
+    return RawResponse(content=audio, media_type="audio/mpeg")
 
 
 @router.get("/stream")
@@ -158,6 +196,10 @@ def dashboard():
             "followups": [serialize.followup(f) for f in upcoming],
             "workload": {"at_risk": feas.at_risk, "min_slack": feas.min_slack, "total_required": feas.total_required,
                          "capacity_7d": feas.capacity_7d},
+            "game": gamify.summary(s),
+            "habits": habits.all_habits(s),
+            "commitments": habits.auto_evaluate(s, today),
+            "budget": get_llm().budget() if hasattr(get_llm(), "budget") else None,
         }
 
 
@@ -165,7 +207,7 @@ def dashboard():
 def agenda(start: str | None = None, days: int = 7):
     with session() as s:
         d = timeutil.parse_date(start) if start else timeutil.week_start(timeutil.today())
-        return {"days": cal.agenda(s, d, max(1, min(days, 31)))}
+        return {"days": cal.agenda(s, d, max(1, min(days, 42)))}
 
 
 # ---------------------------------------------------------------- tasks
@@ -241,6 +283,44 @@ class PlanBody(BaseModel):
     days: int = 7
 
 
+class BlockBody(BaseModel):
+    start: str
+    duration_minutes: int | None = None
+    task_id: int | None = None
+
+
+@router.patch("/blocks/{block_id}")
+async def move_block(block_id: int, body: BlockBody):
+    return await _tool("move_block", {"block_id": block_id, "start": body.start, "duration_minutes": body.duration_minutes})
+
+
+@router.post("/blocks")
+def create_block(body: BlockBody):
+    if not body.task_id:
+        raise HTTPException(400, "task_id لازم است")
+    with session() as s:
+        if s.get(Task, body.task_id) is None:
+            raise HTTPException(404, "تسک پیدا نشد")
+        st = timeutil.parse_datetime(body.start)
+        b = PlannedBlock(task_id=body.task_id, start_at=st, end_at=st + timedelta(minutes=body.duration_minutes or 60),
+                         locked=True)
+        s.add(b)
+        s.flush()
+        bid = b.id
+    bus.publish("data_changed", ["schedule", "followups"])
+    return {"id": bid}
+
+
+@router.delete("/blocks/{block_id}")
+def delete_block(block_id: int):
+    with session() as s:
+        b = s.get(PlannedBlock, block_id)
+        if b:
+            s.delete(b)
+    bus.publish("data_changed", ["schedule", "followups"])
+    return {"deleted": block_id}
+
+
 @router.post("/plan")
 async def run_plan(body: PlanBody):
     return await _tool("plan_schedule", {"days": body.days})
@@ -276,6 +356,201 @@ def get_stats(start: str | None = None, end: str | None = None):
         a = timeutil.parse_date(start) if start else timeutil.week_start(today)
         b = timeutil.parse_date(end) if end else a + timedelta(days=6)
         return stats.productivity(s, a, b)
+
+
+@router.get("/stats/heatmap")
+def heatmap(days: int = 371):
+    from sqlalchemy import func
+
+    with session() as s:
+        today = timeutil.today()
+        start = today - timedelta(days=max(7, min(days, 800)) - 1)
+        rows = (
+            s.query(func.date(WorkLog.start_at), func.sum(WorkLog.minutes))
+            .filter(WorkLog.start_at >= timeutil.at(start, "00:00"), WorkLog.productive.is_(True), WorkLog.end_at.is_not(None))
+            .group_by(func.date(WorkLog.start_at))
+            .all()
+        )
+        by_day = {str(d): int(m or 0) for d, m in rows}
+        out, d = [], start
+        while d <= today:
+            out.append({"date": d.isoformat(), "jalali": timeutil.jalali_str(d), "minutes": by_day.get(d.isoformat(), 0)})
+            d += timedelta(days=1)
+        return {"days": out, "goal_minutes": int(prefs.get("daily_focus_goal_minutes", s=s) or 240)}
+
+
+@router.get("/insights")
+def get_insights():
+    with session() as s:
+        factors = insights.estimation_factors(s)
+        peaks = insights.peak_hours(s)
+        rs = insights.response_stats(s)
+        return {
+            "estimation": factors,
+            "estimation_text": insights.estimation_lines(factors),
+            "peak_hours": peaks["hours"],
+            "peak_hours_learned": peaks["learned"],
+            "hour_profile": peaks["profile"],
+            "reminders": rs,
+            "reminders_text": insights.reminder_lines(rs),
+            "game": gamify.summary(s),
+        }
+
+
+@router.get("/usage")
+def usage(days: int = 30):
+    from sqlalchemy import func
+
+    with session() as s:
+        since = timeutil.today() - timedelta(days=days - 1)
+        by_day = (
+            s.query(LlmUsage.day, func.sum(LlmUsage.cost_usd), func.sum(LlmUsage.prompt_tokens),
+                    func.sum(LlmUsage.completion_tokens), func.count(LlmUsage.id))
+            .filter(LlmUsage.day >= since).group_by(LlmUsage.day).order_by(LlmUsage.day).all()
+        )
+        by_model = (
+            s.query(LlmUsage.model, func.sum(LlmUsage.cost_usd), func.sum(LlmUsage.prompt_tokens),
+                    func.sum(LlmUsage.completion_tokens), func.count(LlmUsage.id),
+                    func.sum(func.cast(LlmUsage.ok == False, Integer)))  # noqa: E712
+            .filter(LlmUsage.day >= since).group_by(LlmUsage.model).all()
+        )
+        by_purpose = (
+            s.query(LlmUsage.purpose, func.sum(LlmUsage.cost_usd), func.count(LlmUsage.id))
+            .filter(LlmUsage.day >= since).group_by(LlmUsage.purpose).all()
+        )
+        return {
+            "budget": get_llm().budget() if hasattr(get_llm(), "budget") else None,
+            "days": [{"day": d.isoformat(), "cost": round(c or 0, 4), "prompt_tokens": int(p or 0),
+                      "completion_tokens": int(ct or 0), "calls": n} for d, c, p, ct, n in by_day],
+            "models": sorted([{"model": m, "cost": round(c or 0, 4), "prompt_tokens": int(p or 0),
+                               "completion_tokens": int(ct or 0), "calls": n, "failures": int(f or 0)}
+                              for m, c, p, ct, n, f in by_model], key=lambda x: -x["cost"]),
+            "purposes": sorted([{"purpose": pu, "cost": round(c or 0, 4), "calls": n} for pu, c, n in by_purpose],
+                               key=lambda x: -x["cost"]),
+            "total_cost": round(sum((c or 0) for _, c, *_ in by_day), 4),
+        }
+
+
+# ---------------------------------------------------------------- habits & commitments
+@router.get("/habits")
+def list_habits():
+    with session() as s:
+        return {"habits": habits.all_habits(s, active_only=False)}
+
+
+@router.post("/habits")
+async def create_habit(body: dict[str, Any]):
+    return await _tool("add_habit", body)
+
+
+@router.patch("/habits/{habit_id}")
+async def patch_habit(habit_id: int, body: dict[str, Any]):
+    return await _tool("update_habit", {**body, "habit_id": habit_id})
+
+
+@router.delete("/habits/{habit_id}")
+async def remove_habit(habit_id: int):
+    return await _tool("delete_habit", {"habit_id": habit_id})
+
+
+@router.post("/habits/{habit_id}/log")
+async def log_habit(habit_id: int, body: dict[str, Any]):
+    return await _tool("log_habit", {**body, "habit_id": habit_id})
+
+
+@router.get("/commitments")
+def list_commitments(day: str | None = None):
+    with session() as s:
+        d = timeutil.parse_date(day) if day else timeutil.today()
+        return {"day": d.isoformat(), "commitments": habits.auto_evaluate(s, d)}
+
+
+@router.post("/commitments")
+async def create_commitment(body: dict[str, Any]):
+    return await _tool("add_commitment", body)
+
+
+@router.patch("/commitments/{commitment_id}")
+async def patch_commitment(commitment_id: int, body: dict[str, Any]):
+    return await _tool("update_commitment", {**body, "commitment_id": commitment_id})
+
+
+# ---------------------------------------------------------------- IELTS
+@router.get("/ielts")
+def ielts_overview():
+    with session() as s:
+        return ielts.progress(s)
+
+
+@router.post("/ielts/scores")
+async def add_ielts_score(body: dict[str, Any]):
+    return await _tool("log_ielts_score", body)
+
+
+@router.delete("/ielts/scores/{score_id}")
+def remove_ielts_score(score_id: int):
+    with session() as s:
+        sc = s.get(IeltsScore, score_id)
+        if sc:
+            s.delete(sc)
+    bus.publish("data_changed", ["ielts"])
+    return {"deleted": score_id}
+
+
+@router.get("/vocab")
+def list_vocab(due: bool = False):
+    with session() as s:
+        rows = ielts.due_words(s, 200) if due else s.query(VocabWord).order_by(VocabWord.box, VocabWord.due).all()
+        return {"words": [ielts.word_dict(w) for w in rows], "stats": ielts.vocab_stats(s)}
+
+
+@router.post("/vocab")
+async def add_vocab(body: dict[str, Any]):
+    return await _tool("add_vocab", body)
+
+
+@router.post("/vocab/{word_id}/review")
+async def review_vocab(word_id: int, body: dict[str, Any]):
+    return await _tool("vocab_review", {"word_id": word_id, "correct": bool(body.get("correct"))})
+
+
+@router.delete("/vocab/{word_id}")
+def remove_vocab(word_id: int):
+    with session() as s:
+        w = s.get(VocabWord, word_id)
+        if w:
+            s.delete(w)
+    bus.publish("data_changed", ["ielts"])
+    return {"deleted": word_id}
+
+
+# ---------------------------------------------------------------- web push
+@router.get("/push/key")
+def push_key():
+    return {"public_key": push.vapid_keys()[1], "subscriptions": push.count()}
+
+
+@router.post("/push/subscribe")
+def push_subscribe(body: dict[str, Any], request: Request):
+    try:
+        push.subscribe(body, request.headers.get("user-agent", ""))
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    return {"ok": True, "subscriptions": push.count()}
+
+
+@router.post("/push/unsubscribe")
+def push_unsubscribe(body: dict[str, Any]):
+    push.unsubscribe(str(body.get("endpoint", "")))
+    return {"ok": True}
+
+
+@router.post("/push/test")
+async def push_test():
+    n = await push.notify_all("پیگیر", "🔔 اعلان آزمایشی — نوتیفیکیشن مرورگر کار می‌کند.", tag="test")
+    if not n:
+        raise HTTPException(400, "هیچ مرورگری مشترک نیست یا ارسال ناموفق بود")
+    return {"sent": n}
 
 
 # ---------------------------------------------------------------- reports
@@ -356,6 +631,17 @@ def list_followups():
         return {"followups": [serialize.followup(f) for f in rows]}
 
 
+@router.post("/followups/{followup_id}/snooze")
+def snooze_followup(followup_id: int, minutes: int = 60):
+    from .. import followups as fu
+
+    with session() as s:
+        f = fu.snooze(s, followup_id, minutes)
+        at = f.due_at
+    bus.publish("data_changed", ["followups"])
+    return {"due": timeutil.iso(at)}
+
+
 @router.delete("/followups/{followup_id}")
 async def remove_followup(followup_id: int):
     return await _tool("cancel_followup", {"followup_id": followup_id})
@@ -365,17 +651,28 @@ async def remove_followup(followup_id: int):
 @router.get("/settings")
 def get_settings_api():
     st = get_settings()
+    llm = get_llm()
+    model = getattr(llm, "model", None)
     return {
-        "prefs": prefs.all_prefs(),
+        "prefs": {k: v for k, v in prefs.all_prefs().items()},
         "telegram": telegram.status(),
         "llm": {
             "configured": bool(st.gapgpt_api_key),
             "base_url": st.gapgpt_base_url,
-            "chat_model": st.chat_model,
-            "fast_model": st.fast_model,
-            "vision_model": st.vision_model,
+            "proxy": bool(st.llm_proxy),
+            "chat_model": model("chat") if model else st.chat_model,
+            "fast_model": model("fast") if model else st.fast_model,
+            "vision_model": model("vision") if model else st.vision_model,
+            "ielts_model": model("ielts") if model else st.chat_model,
             "transcribe_model": st.transcribe_model,
+            "tts_model": st.tts_model,
+            "embedding_model": st.embedding_model,
+            "fallback_models": st.fallback_models,
+            "env_defaults": {"chat": st.chat_model, "fast": st.fast_model, "vision": st.vision_model,
+                             "ielts": st.ielts_model or st.chat_model},
         },
+        "budget": llm.budget() if hasattr(llm, "budget") else None,
+        "push": {"subscriptions": push.count()},
         "timezone": st.timezone,
     }
 
@@ -397,9 +694,11 @@ def telegram_unlink():
 
 @router.post("/telegram/test")
 async def telegram_test():
-    sent = await telegram.send_to_owner("🔔 پیام آزمایشی از پیگیر — تلگرام درست کار می‌کند.")
-    if not sent:
+    if telegram.owner_chat_id() is None:
         raise HTTPException(400, "تلگرام وصل نیست")
+    sent = await outbox.send("text", {"text": "🔔 پیام آزمایشی از پیگیر — تلگرام درست کار می‌کند."})
+    if not sent:
+        raise HTTPException(502, "ارسال به تلگرام ناموفق بود؛ در صف ارسال مجدد قرار گرفت")
     return {"ok": True}
 
 

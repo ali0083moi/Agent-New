@@ -6,9 +6,9 @@ import logging
 from datetime import timedelta
 from typing import Any
 
-from .. import cal, followups, notify, planner, prefs, reports, stats, timeutil
+from .. import cal, followups, gamify, habits, ielts, notify, planner, prefs, reports, rescue, stats, timeutil
 from ..bus import bus
-from ..db import Followup, PlannedBlock, RecurringEvent, Task, session
+from ..db import Followup, Habit, PlannedBlock, RecurringEvent, Task, session
 from . import core
 
 log = logging.getLogger(__name__)
@@ -113,29 +113,42 @@ def build(f: Followup) -> tuple[str, str, list[str]] | None:
                 .all()
             )
             y = stats.productivity(s, now.date() - timedelta(days=1), now.date() - timedelta(days=1))
+            hb = [h for h in habits.all_habits(s) if h["period"] == "daily"]
+            g = gamify.summary(s)
             instr = (
                 "Morning brief. Write a friendly, energizing but compact plan for today: classes/events, the work blocks, "
-                "and the most important 1-3 things to finish. Mention deadlines in the next 3 days. One short motivating line.\n"
+                "and the most important 1-3 things to finish. Mention deadlines in the next 3 days. Then ask what they "
+                "commit to today (one concrete promise, e.g. '۲ ساعت رایتینگ') so you can record it with add_commitment. "
+                "One short motivating line.\n"
                 f"Today's agenda: {day['items']}\nDue within 3 days: {[_task_line(s, x) for x in soon]}"
                 f"{plan_txt}\nYesterday productive minutes: {y['total_productive_minutes']} (goal {y['daily_goal_minutes']})"
+                f"\nDaily habits & streaks: {[(h['title'], h['streak']) for h in hb]}"
+                f"\nLevel {g['level']} ({g['title']}), this week's score so far {g['weekly_score']['score']}/100"
             )
             lines = [f"☀️ صبح بخیر! برنامه امروز ({timeutil.fa_date(now)}):"]
             lines += [f"- {timeutil.fa_digits(it['start'][11:])} {it['title']}" for it in day["items"]] or ["- برنامه ثابتی نداری"]
             if soon:
                 lines.append("ددلاین‌های نزدیک:")
                 lines += [f"- {_task_line(s, x)}" for x in soon]
-            return instr, "\n".join(lines), []
+            lines.append("امروز چه قولی به خودت می‌دی؟ 🤝")
+            return instr, "\n".join(lines), ["۲ ساعت کار عمیق", "تموم کردن یه تسک"]
 
         if f.kind == "daily_review":
             st = stats.productivity(s, now.date(), now.date())
             tomorrow = cal.agenda(s, now.date() + timedelta(days=1), 1)[0]
+            commits = habits.auto_evaluate(s, now.date())
+            hb = [h for h in habits.all_habits(s) if h["period"] == "daily"]
+            pts = gamify.points_between(s, now.date(), now.date())
             instr = (
                 "Evening review. Summarize today honestly in a few lines: productive time vs goal, tasks completed, "
-                "planned blocks done vs skipped. Then ask what else they did today that isn't logged yet (to log it) "
-                "and mention tomorrow's key items briefly.\n"
+                "planned blocks done vs skipped, today's commitments (kept or not — ask about the pending ones and record "
+                "the outcome with update_commitment), habits not done yet, points earned today. Then ask what else they "
+                "did today that isn't logged yet (to log it) and mention tomorrow's key items briefly.\n"
                 f"Today stats: productive {st['total_productive_minutes']} min (goal {st['daily_goal_minutes']}), "
                 f"by category {st['by_category']}, completed {[x['title'] for x in st['completed_tasks']]}, "
-                f"blocks {st['blocks']}.\nTomorrow: {tomorrow['items']}"
+                f"blocks {st['blocks']}.\nCommitments: {commits}\n"
+                f"Habits: {[(h['title'], h['today'], h['target'], h['streak']) for h in hb]}\nPoints today: {pts['total']}\n"
+                f"Tomorrow: {tomorrow['items']}"
             )
             fallback = (
                 f"🌙 جمع‌بندی امروز: {timeutil.fa_duration(st['total_productive_minutes'])} کار مفید ثبت شده "
@@ -163,6 +176,66 @@ def build(f: Followup) -> tuple[str, str, list[str]] | None:
             instr = f"The focus timer for «{d['task'] or d['description']}» has been running {d['elapsed_minutes']} min. Ask if they're still working or forgot to stop it."
             fallback = f"⏱ تایمر «{d['task'] or d['description']}» {timeutil.fa_duration(d['elapsed_minutes'])}ه روشنه. هنوز داری کار می‌کنی؟"
             return instr, fallback, ["هنوز دارم کار می‌کنم", "یادم رفت خاموشش کنم"]
+
+        if f.kind == "rescue":
+            data = rescue.analyze(s)
+            if not data.get("needed"):
+                return None
+            instr = (
+                "RESCUE MODE: with the current workload the user will miss deadlines. Calmly explain which tasks are at "
+                "risk and by how much (short), then offer 2-3 concrete ways out: postpone specific lower-priority tasks "
+                "(and how much time that frees), add extra time per day, ask for an extension (offer to draft the "
+                "message to the professor/manager in Persian), or shrink the scope. Ask which option they pick; when they "
+                "decide, apply it with tools (update_task due/priority/status, update_preferences, plan_schedule).\n"
+                f"Analysis: {data}"
+            )
+            names = "، ".join(f"«{t['title']}»" for t in data["at_risk"])
+            fallback = (f"🛟 با این حجم کار به {names} نمی‌رسی (حدود {timeutil.fa_duration(data['shortfall_minutes'])} کم داریم). "
+                        "بیا با هم تصمیم بگیریم چی رو عقب بندازیم یا تمدید بگیریم.")
+            return instr, fallback, ["چی رو عقب بندازیم؟", "متن درخواست تمدید رو بنویس", "روزی یه ساعت بیشتر کار می‌کنم"]
+
+        if f.kind == "weekly_planning":
+            ws_next = timeutil.week_start(now.date()) + timedelta(days=7)
+            nxt = cal.agenda(s, ws_next, 7)
+            due_next = (
+                s.query(Task).filter(Task.status.in_(["todo", "doing"]), Task.due_at.is_not(None),
+                                     Task.due_at < timeutil.at(ws_next + timedelta(days=7), "00:00")).order_by(Task.due_at).all()
+            )
+            week = stats.productivity(s, timeutil.week_start(now.date()), now.date())
+            score = gamify.weekly_score(s, timeutil.week_start(now.date()))
+            instr = (
+                "Weekly planning session for NEXT week. Briefly recap this week (productive time, weekly score), list next "
+                "week's fixed commitments and known deadlines, then ask: any new tasks, exams, events or goals for next week? "
+                "Tell them that after they answer you will lay out the whole week (then you'll call plan_schedule with days=9). "
+                "Keep it structured but short.\n"
+                f"This week: {week['total_productive_minutes']} productive min, score {score}\n"
+                f"Next week agenda: {[(d['weekday_fa'], [(i['type'], i['title'], i['start'][11:]) for i in d['items'] if i['type'] != 'block']) for d in nxt]}\n"
+                f"Known deadlines: {[_task_line(s, t) for t in due_next]}"
+            )
+            fallback = "🗓 وقت برنامه‌ریزی هفته بعده! کار، امتحان یا قرار جدیدی برای هفته بعد داری؟ بگو تا کل هفته رو بچینم."
+            return instr, fallback, ["بریم بچینیم", "چیز جدیدی ندارم، فقط بچین"]
+
+        if f.kind == "habit_reminder":
+            h = s.get(Habit, (f.payload or {}).get("habit_id"))
+            if h is None:
+                return None
+            st = habits.habit_stats(s, h)
+            instr = (f"Habit nudge: «{h.title}» isn't done yet today (target {h.target} {st['unit_fa']}, current streak "
+                     f"{st['streak']} days, best {st['best_streak']}). Short, encouraging; mention the streak at stake. "
+                     f"If they say they did it, log it with log_habit (habit id {h.id}).")
+            fallback = f"🔁 «{h.title}» امروز هنوز انجام نشده" + (f" — زنجیره {timeutil.fa_digits(st['streak'])} روزه‌ات رو نشکن! 🔥" if st["streak"] else "")
+            return instr, fallback, ["انجامش دادم ✅", "امروز نمی‌شه"]
+
+        if f.kind == "vocab_review":
+            words = ielts.due_words(s, int(prefs.get("vocab_daily_count", s=s) or 8))
+            if not words:
+                return None
+            listing = [{"id": w.id, "word": w.word, "box": w.box} for w in words]
+            instr = ("Daily IELTS vocabulary review (spaced repetition). Ask the user the meaning of these words (show only "
+                     "the words, numbered; do NOT reveal meanings). When they answer, check each one and call vocab_review "
+                     f"for every word, then show the correct meanings for the ones they missed.\nWords: {listing}")
+            fallback = "📇 مرور لغت امروز — معنی این‌ها چیه؟\n" + "\n".join(f"{timeutil.fa_digits(i + 1)}. {w.word}" for i, w in enumerate(words))
+            return instr, fallback, ["بلد نیستم، معنی‌ها رو بگو"]
 
         if f.kind == "custom":
             extra = f" Related task: {_task_line(s, t)}." if t else ""
@@ -225,4 +298,10 @@ async def tick() -> int:
                 sent += 1
         except Exception:  # noqa: BLE001
             log.exception("dispatch of follow-up %s failed", fid)
+    from .. import outbox
+
+    try:
+        await outbox.flush()
+    except Exception:  # noqa: BLE001
+        log.exception("outbox flush failed")
     return sent

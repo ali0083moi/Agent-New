@@ -25,12 +25,22 @@ def task(s: Session, t: Task, with_time: bool = True) -> dict[str, Any]:
         "notes": t.notes,
         "recurring_event_id": t.recurring_event_id,
         "goal_id": t.goal_id,
+        "parent_id": t.parent_id,
+        "energy": t.energy or "normal",
         "created_at": timeutil.iso(t.created_at),
         "completed_at": timeutil.iso(t.completed_at),
     }
     if with_time:
         d["spent_minutes"] = planner.spent_minutes(s, t.id)
         d["remaining_minutes"] = planner.remaining_minutes(s, t)
+        if t.estimated_minutes and t.status in ("todo", "doing"):
+            adj = planner.adjusted_estimate(s, t)
+            if adj != t.estimated_minutes:
+                d["adjusted_estimate_minutes"] = adj
+        kids = s.query(Task.status).filter(Task.parent_id == t.id).all()
+        if kids:
+            d["subtasks_total"] = len(kids)
+            d["subtasks_done"] = sum(1 for (st,) in kids if st == "done")
     return d
 
 

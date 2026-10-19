@@ -13,8 +13,8 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from . import cal, prefs, stats, timeutil
-from .db import Followup, Message, PlannedBlock, RecurringEvent, Task
+from . import cal, insights, planner, prefs, stats, timeutil
+from .db import Followup, Habit, HabitLog, Message, PlannedBlock, RecurringEvent, Task, VocabWord
 
 log = logging.getLogger(__name__)
 
@@ -38,7 +38,14 @@ MAX_DELAY = {
     "deadline": timedelta(hours=6),
     "task_checkin": timedelta(hours=12),
     "overdue": timedelta(hours=24),
+    "rescue": timedelta(hours=6),
+    "weekly_planning": timedelta(hours=6),
+    "habit_reminder": timedelta(hours=3),
+    "vocab_review": timedelta(hours=6),
 }
+
+
+_last_rescue_check: datetime | None = None
 
 
 def _ensure(s: Session, key: str, kind: str, due: datetime, **fields: Any) -> Followup | None:
@@ -56,7 +63,8 @@ def _intensity(p: dict[str, Any]) -> str:
     return v if v in DEADLINE_OFFSETS else "normal"
 
 
-def ensure_task_followups(s: Session, t: Task, p: dict[str, Any], now: datetime) -> list[Followup]:
+def ensure_task_followups(s: Session, t: Task, p: dict[str, Any], now: datetime,
+                          rstats: dict[str, Any] | None = None) -> list[Followup]:
     """Deadline reminders, a midpoint check-in and an overdue check for one task."""
     created: list[Followup] = []
     if not t.due_at or t.status not in ("todo", "doing"):
@@ -69,8 +77,12 @@ def ensure_task_followups(s: Session, t: Task, p: dict[str, Any], now: datetime)
         if at <= now + timedelta(minutes=20) or at <= (t.created_at or now) + timedelta(minutes=30):
             continue
         hours = int(off.total_seconds() // 3600)
-        f = _ensure(s, f"deadline:{t.id}:{due_iso}:{hours}h", "deadline", at,
-                    payload={"due": due_iso, "hours_before": hours}, task_id=t.id)
+        key = f"deadline:{t.id}:{due_iso}:{hours}h"
+        if s.query(Followup.id).filter(Followup.dedupe_key == key).first():
+            continue
+        adjusted = insights.adjust_time(s, at, "deadline", now, rstats)
+        f = _ensure(s, key, "deadline", adjusted, payload={"due": due_iso, "hours_before": hours}, task_id=t.id,
+                    shifted_from=at if adjusted != at else None)
         if f:
             created.append(f)
     span = t.due_at - (t.created_at or now)
@@ -105,6 +117,14 @@ def generate(s: Session, now: datetime | None = None) -> int:
     p = prefs.all_prefs(s)
     horizon = now + timedelta(hours=36)
     n = 0
+    rstats = insights.response_stats(s)
+
+    # 0) housekeeping: past blocks nobody worked in -> skipped (+ re-plan); close yesterday's commitments
+    if planner.sweep_missed(s, now) and p.get("auto_replan", True):
+        planner.plan(s, days=7)
+    from . import habits as habits_mod
+
+    habits_mod.close_past(s, now.date())
 
     # 1) after classes: ask about homework / tasks for next session
     delay = timedelta(minutes=int(p.get("post_class_delay_minutes") or 15))
@@ -122,9 +142,10 @@ def generate(s: Session, now: datetime | None = None) -> int:
 
     # 2) task deadlines
     for t in s.query(Task).filter(Task.status.in_(["todo", "doing"]), Task.due_at.is_not(None)).all():
-        n += len(ensure_task_followups(s, t, p, now))
+        n += len(ensure_task_followups(s, t, p, now, rstats))
 
-    # 3) planned work blocks: nudge at start, check at end
+    # 3) planned work blocks: nudge at start, check at end (fewer nudges if they're always ignored)
+    ignore_starts = insights.quiet_kind(rstats, "block_start")
     if p.get("block_nudges", True):
         blocks = (
             s.query(PlannedBlock)
@@ -134,8 +155,11 @@ def generate(s: Session, now: datetime | None = None) -> int:
         )
         for b in blocks:
             payload = {"start": timeutil.iso(b.start_at), "end": timeutil.iso(b.end_at)}
-            if _ensure(s, f"block_start:{b.id}:{payload['start']}", "block_start", b.start_at, block_id=b.id,
-                       task_id=b.task_id, payload=payload):
+            task = s.get(Task, b.task_id)
+            if ignore_starts and task is not None and task.priority != 1:
+                pass  # the user ignores start nudges: keep them only for important tasks
+            elif _ensure(s, f"block_start:{b.id}:{payload['start']}", "block_start", b.start_at, block_id=b.id,
+                         task_id=b.task_id, payload=payload):
                 n += 1
             if _ensure(s, f"block_end:{b.id}:{payload['end']}", "block_end", b.end_at + timedelta(minutes=5),
                        block_id=b.id, task_id=b.task_id, payload=payload):
@@ -156,8 +180,34 @@ def generate(s: Session, now: datetime | None = None) -> int:
                                                                       payload={"week_start": ws}):
                 n += 1
 
+        if timeutil.weekday_key(day) == p.get("weekly_planning_day", "fri"):
+            at = timeutil.at(day, p["weekly_planning_time"])
+            ws = timeutil.week_start(day).isoformat()
+            if at > now - MAX_DELAY["weekly_planning"] and _ensure(s, f"weekly_planning:{ws}", "weekly_planning", at,
+                                                                    payload={"week_start": ws}):
+                n += 1
+
     # 5) idle check-in during the productive window
-    n += _idle_checkin(s, now, p)
+    n += _idle_checkin(s, now, p, rstats)
+
+    # 6b) habits not done yet today, IELTS vocabulary review
+    n += _habit_reminders(s, now, rstats)
+    if s.query(VocabWord.id).filter(VocabWord.due <= now.date()).first():
+        at = insights.adjust_time(s, timeutil.at(now.date(), p["vocab_review_time"]), "vocab_review", now, rstats)
+        if at > now - MAX_DELAY["vocab_review"] and _ensure(s, f"vocab_review:{now.date().isoformat()}", "vocab_review", at):
+            n += 1
+
+    # 7) rescue mode: the workload no longer fits before the deadlines (checked every 10 minutes)
+    global _last_rescue_check
+    if p.get("rescue_mode", True) and not is_quiet(now, p) and (
+        _last_rescue_check is None or abs((now - _last_rescue_check).total_seconds()) >= 600
+    ):
+        _last_rescue_check = now
+        feas = planner.feasibility(s, start=now)
+        if feas.at_risk:
+            ids = "-".join(str(t["task_id"]) for t in sorted(feas.at_risk, key=lambda x: x["task_id"]))
+            if _ensure(s, f"rescue:{now.date().isoformat()}:{ids}", "rescue", now, payload={"task_ids": ids}):
+                n += 1
 
     # 6) a focus timer that has been running for very long (forgot to stop?)
     cur = stats.active_focus(s)
@@ -176,7 +226,36 @@ def _sent_today(s: Session, kind: str, day) -> bool:
     )
 
 
-def _idle_checkin(s: Session, now: datetime, p: dict[str, Any]) -> int:
+def _habit_reminders(s: Session, now: datetime, rstats: dict[str, Any]) -> int:
+    n = 0
+    for h in s.query(Habit).filter(Habit.active.is_(True), Habit.reminder_time.is_not(None), Habit.period == "daily").all():
+        at = insights.adjust_time(s, timeutil.at(now.date(), h.reminder_time), "habit_reminder", now, rstats)
+        if at < now - MAX_DELAY["habit_reminder"]:
+            continue
+        if _ensure(s, f"habit:{h.id}:{now.date().isoformat()}", "habit_reminder", at, payload={"habit_id": h.id}):
+            n += 1
+    return n
+
+
+def snooze(s: Session, followup_id: int, minutes: int = 60, now: datetime | None = None) -> Followup:
+    """Re-send a follow-up later ("remind me in an hour")."""
+    now = now or timeutil.now()
+    src = s.get(Followup, followup_id)
+    if src is None:
+        raise ValueError("یادآوری پیدا نشد")
+    src.responded_at = src.responded_at or now
+    f = Followup(kind=src.kind, due_at=now + timedelta(minutes=minutes), note=src.note, payload=dict(src.payload or {}),
+                 task_id=src.task_id, recurring_event_id=src.recurring_event_id, block_id=src.block_id,
+                 created_by="snooze")
+    if f.kind == "block_start":  # the block itself moved on; ask generally instead
+        f.kind, f.block_id = "custom", None
+        f.note = src.note or "شروع کار روی تسکی که برایش بلوک داشتی"
+    s.add(f)
+    s.flush()
+    return f
+
+
+def _idle_checkin(s: Session, now: datetime, p: dict[str, Any], rstats: dict[str, Any] | None = None) -> int:
     hours = float(p.get("idle_checkin_hours") or 0)
     if hours <= 0 or is_quiet(now, p):
         return 0
@@ -197,7 +276,10 @@ def _idle_checkin(s: Session, now: datetime, p: dict[str, Any]) -> int:
         return 0
     day = now.date().isoformat()
     sent_today = s.query(Followup).filter(Followup.dedupe_key.like(f"idle:{day}:%")).count()
-    if sent_today >= IDLE_MAX_PER_DAY[_intensity(p)]:
+    limit = IDLE_MAX_PER_DAY[_intensity(p)]
+    if rstats is not None and insights.quiet_kind(rstats, "idle_checkin"):
+        limit = 1  # mostly ignored: once a day is enough
+    if sent_today >= limit:
         return 0
     return 1 if _ensure(s, f"idle:{day}:{sent_today + 1}", "idle_checkin", now) else 0
 
@@ -225,6 +307,20 @@ def _still_valid(s: Session, f: Followup, now: datetime) -> bool:
         if r is None or not r.active:
             return False
     if f.kind == "focus_long" and stats.active_focus(s) is None:
+        return False
+    if f.kind == "habit_reminder":
+        h = s.get(Habit, (f.payload or {}).get("habit_id"))
+        if h is None or not h.active:
+            return False
+        from sqlalchemy import func
+
+        done = s.query(func.coalesce(func.sum(HabitLog.value), 0)).filter(HabitLog.habit_id == h.id,
+                                                                           HabitLog.day == now.date()).scalar()
+        if (done or 0) >= h.target:
+            return False
+    if f.kind == "vocab_review" and not s.query(VocabWord.id).filter(VocabWord.due <= now.date()).first():
+        return False
+    if f.kind == "rescue" and not planner.feasibility(s, start=now).at_risk:
         return False
     if f.kind in ("daily_brief", "daily_review"):
         pref = prefs.get(f"{f.kind}_time", s=s)

@@ -41,6 +41,27 @@ The user may write in Finglish or English; always answer in Persian unless asked
 - Remember long-term facts about the user with `remember` (job, employer, people, routines, preferences, study goals).
 - Weekly report: use weekly_report; it creates two parts: a professional work report for the employer and a personal
   review. Show both.
+- Forwarded messages (e.g. from a class group / professor / manager) and attached files (PDF syllabus, assignment
+  sheet): extract every homework, exam, deadline or meeting and save it, linked to the matching class when the group or
+  file obviously belongs to one. Then confirm briefly what you saved.
+- Big tasks (more than ~3 hours or several days): split them with break_down_task into milestones with intermediate
+  deadlines. Exams (e.g. final exams): use plan_exam_prep for backward planning from the exam date.
+- Set energy=high for deep/hard work (essays, projects, studying), low for easy admin/errands; the planner puts deep work
+  in the user's peak hours.
+- Use the learned estimation bias below when estimating (e.g. if writing tasks take 1.5× longer, say so and estimate higher).
+- When the plan has warnings or the user feels behind, use rescue_plan and help them choose: postpone, more time per day,
+  ask for an extension (draft the message), or shrink the scope.
+- Deletions ask for confirmation: the delete tools first return needs_confirmation — ask the user, and only delete after
+  they confirm in their next message. "برگردون"/undo → undo_last.
+- Habits: when the user mentions doing a tracked habit ("امروز دویدم", "دیشب ۶ ساعت خوابیدم") log it with log_habit;
+  when they want to build a habit, add_habit (suggest a reminder time). Celebrate streaks.
+- Daily commitments: when the user promises something for today, save it with add_commitment (measurable:
+  target_minutes + task/category). In the evening review, record outcomes with update_commitment.
+- IELTS coach: an English essay (typed, or transcribed from a photo) → grade_ielts_writing and give focused feedback
+  (bands per criterion, top improvements, corrections) and offer to add new vocabulary with add_vocab. Speaking
+  practice → pick a realistic question/cue card, call start_speaking_practice, ask for a voice answer, then
+  grade_ielts_speaking on the transcript. Reported mock scores → log_ielts_score. Vocabulary quiz answers →
+  vocab_review per word.
 - Be honest about productivity: praise real progress, call out procrastination kindly but clearly.
 - When you do things, confirm briefly what you saved (e.g. "✅ ثبت شد: ... — ددلاین سه‌شنبه ۱۸:۰۰"). Don't list IDs to
   the user. Don't dump raw JSON. Use light Markdown (bold, bullet lists); avoid tables and headings in normal chat.
@@ -118,16 +139,19 @@ def build_context(s: Session) -> str:
         s.query(Task)
         .filter(Task.status.in_(["todo", "doing"]))
         .order_by(Task.due_at.is_(None), Task.due_at, Task.priority)
-        .limit(40)
+        .limit(50)
         .all()
     )
     lines.append("\n## Open tasks")
     for t in tasks:
         lines.append(
-            f"- [task {t.id}] {t.title} | {t.category} | {t.status} | p{t.priority}"
+            ("  - ↳ " if t.parent_id else "- ")
+            + f"[task {t.id}] {t.title} | {t.category} | {t.status} | p{t.priority}"
             + (f" | due {timeutil.iso(t.due_at)}" if t.due_at else " | no deadline")
             + f" | est {_fmt_minutes(t.estimated_minutes)} remaining {_fmt_minutes(planner.remaining_minutes(s, t))}"
             + (f" | {t.progress}%" if t.progress else "")
+            + (f" | energy {t.energy}" if t.energy != "normal" else "")
+            + (f" | subtask of {t.parent_id}" if t.parent_id else "")
             + (f" | class {t.recurring_event_id}" if t.recurring_event_id else "")
         )
     if not tasks:
@@ -148,6 +172,42 @@ def build_context(s: Session) -> str:
         lines.append(f"\n## Focus timer RUNNING: {f['task'] or f['description']} since {f['start']} ({f['elapsed_minutes']} min)")
     today_min = planner.logged_minutes(s, today)
     lines.append(f"\nProductive time logged today: {_fmt_minutes(today_min) if today_min else '0m'}")
+
+    from .. import habits as habits_mod, ielts as ielts_mod, insights
+
+    hb = habits_mod.all_habits(s)
+    if hb:
+        lines.append("\n## Habits")
+        lines += [
+            f"- [habit {h['id']}] {h['title']}: target {h['target']} {h['unit']}/{h['period']}, today {h['today']}, "
+            f"streak {h['streak']} (best {h['best_streak']})" + (f", reminder {h['reminder_time']}" if h["reminder_time"] else "")
+            for h in hb
+        ]
+    commits = habits_mod.auto_evaluate(s, today)
+    if commits:
+        lines.append("\n## Today's commitments")
+        lines += [
+            f"- [commitment {c['id']}] {c['text']} — {c['status']}"
+            + (f" ({c['logged_minutes']}/{c['target_minutes']} min)" if c["target_minutes"] else "")
+            for c in commits
+        ]
+    factors = insights.estimation_factors(s)
+    est_lines = insights.estimation_lines(factors)
+    peaks = insights.peak_hours(s)
+    rs_lines = insights.reminder_lines(insights.response_stats(s))
+    lines.append("\n## Learned about the user")
+    lines.append(f"- peak productive hours: {insights.describe_hours(peaks['hours'])}" + ("" if peaks["learned"] else " (default, not enough data yet)"))
+    lines += [f"- {x}" for x in est_lines + rs_lines]
+    ip = ielts_mod.progress(s)
+    if ip["latest"] or ip["vocab"]["total"] or any(g.title.lower().find("ielts") >= 0 or "آیلتس" in g.title for g in goals):
+        lines.append("\n## IELTS")
+        lines.append(
+            f"- target band {ip['target_band']}" + (f", exam {ip['exam_date']} ({ip['days_left']} days left)" if ip["exam_date"] else "")
+            + f"; latest: {ip['latest'] or 'no scores yet'}; vocab {ip['vocab']['total']} words, {ip['vocab']['due_today']} due today"
+        )
+    sp = prefs.get("speaking_practice", s=s)
+    if sp:
+        lines.append(f"- speaking practice active until {sp.get('until')}: «{sp.get('question')}» (part {sp.get('part')})")
 
     fus = (
         s.query(Followup)

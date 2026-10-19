@@ -48,6 +48,12 @@ def collect(week_start: date, week_end: date) -> dict[str, Any]:
             {"title": g.title, "target_date": timeutil.iso(g.target_date), "progress_note": g.progress_note}
             for g in s.query(Goal).filter(Goal.status == "active").all()
         ]
+        from . import gamify, habits, ielts
+
+        score = gamify.weekly_score(s, week_start)
+        points = gamify.points_between(s, week_start, week_end)
+        habit_list = habits.all_habits(s)
+        ielts_progress = ielts.progress(s)
         return {
             "user_name": p.get("user_name") or "",
             "employer_name": p.get("employer_name") or "",
@@ -61,6 +67,11 @@ def collect(week_start: date, week_end: date) -> dict[str, Any]:
             "work_open": [t for t in open_items if t["category"] in work_cats],
             "open_items": open_items,
             "goals": goals,
+            "weekly_score": score,
+            "points": points,
+            "habits": [{"title": h["title"], "streak": h["streak"], "last7": [d["met"] for d in h["last7"]]} for h in habit_list],
+            "ielts": {"latest": ielts_progress["latest"], "target": ielts_progress["target_band"],
+                      "vocab": ielts_progress["vocab"]},
         }
 
 
@@ -99,6 +110,7 @@ def _fallback_personal(data: dict[str, Any]) -> str:
         f"هدف روزانه {timeutil.fa_duration(st['daily_goal_minutes'])})"
     )
     lines.append(f"- کارهای تمام‌شده: {timeutil.fa_digits(len(st['completed_tasks']))}")
+    lines.append(f"- نمره هفته: {timeutil.fa_digits(data['weekly_score']['score'])} از ۱۰۰ · امتیاز: {timeutil.fa_digits(data['points']['total'])}")
     if st["by_category"]:
         lines.append("\n### به تفکیک حوزه")
         lines += [f"- {c['label']}: {timeutil.fa_duration(c['minutes'])}" for c in st["by_category"]]
@@ -121,9 +133,9 @@ If there is very little data, keep it short and honest. Use Persian digits for n
 
 PERSONAL_PROMPT = """You are the user's personal assistant writing their weekly self-review in Persian (Farsi),
 warm but honest, like a good coach. Markdown with short sections: "## مرور هفته" with date range,
-عدد‌ها (productive time vs daily goal, tasks done, planned blocks done vs skipped), بردهای هفته,
-چیزهایی که عقب افتاد, وضعیت اهداف (e.g. IELTS / language progress if present), and 3 concrete suggestions for
-next week based on upcoming deadlines. Do not invent data. Use Persian digits."""
+عدد‌ها (weekly score /100, points, productive time vs daily goal, tasks done, planned blocks done vs skipped),
+بردهای هفته, چیزهایی که عقب افتاد, عادت‌ها (streaks), وضعیت اهداف (e.g. IELTS bands vs target, vocabulary), and 3
+concrete suggestions for next week based on upcoming deadlines. Do not invent data. Use Persian digits."""
 
 
 async def generate(offset: int = 0, ref: date | None = None) -> Report:
@@ -150,6 +162,8 @@ async def generate(offset: int = 0, ref: date | None = None) -> Report:
         rep.work_report = work
         rep.personal_report = personal
         rep.stats = {
+            "weekly_score": data["weekly_score"]["score"],
+            "points": data["points"]["total"],
             "total_productive_minutes": data["stats"]["total_productive_minutes"],
             "completed": len(data["stats"]["completed_tasks"]),
             "by_category": data["stats"]["by_category"],

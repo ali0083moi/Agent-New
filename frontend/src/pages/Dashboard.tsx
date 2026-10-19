@@ -1,11 +1,11 @@
-import { AlertTriangle, BellRing, CalendarDays, CheckCircle2, Flame, ListTodo, Target, Wand2 } from "lucide-react";
+import { AlertTriangle, BellRing, CalendarDays, CheckCircle2, Flame, HandHeart, ListTodo, Target, Trophy, Wallet, Wand2 } from "lucide-react";
 import { useState } from "react";
 import { api, type Dashboard as D } from "../api";
 import { useData, useLive } from "../live";
 import { Button, Card, Empty, Ring, Spinner, Stat } from "../components/ui";
 import { CategoryBars, FocusCard, Timeline, WeekBars } from "../components/widgets";
 import { TaskItem } from "../components/TaskItem";
-import { duration, fa, faDateTime, FOLLOWUP_KIND, serverNow, shortDuration, syncServerClock } from "../util";
+import { cx, duration, fa, faDateTime, FOLLOWUP_KIND, serverNow, shortDuration, syncServerClock } from "../util";
 
 function greeting(): string {
   const h = serverNow().getHours();
@@ -91,6 +91,46 @@ export default function Dashboard({ go }: { go: (page: string) => void }) {
         <Stat label="این هفته" value={shortDuration(data.week.total_productive_minutes)} sub={`میانگین روزانه ${shortDuration(data.week.average_per_day_minutes)}`} icon={<Flame className="size-5" />} tone="amber" />
         <Stat label="انجام‌شده این هفته" value={fa(data.week.completed)} sub={`بلوک‌ها: ${fa(data.week.blocks.done)} از ${fa(data.week.blocks.planned)}`} icon={<CheckCircle2 className="size-5" />} tone="emerald" />
       </div>
+
+      <button onClick={() => go("progress")} className="card flex w-full flex-wrap items-center gap-x-6 gap-y-3 p-4 text-start transition hover:border-brand-300">
+        <div className="flex items-center gap-3">
+          <div className="rounded-xl bg-gradient-to-br from-brand-500 to-fuchsia-500 p-2.5 text-white">
+            <Trophy className="size-5" />
+          </div>
+          <div>
+            <div className="text-xs text-slate-500">سطح {fa(data.game.level)}</div>
+            <div className="font-extrabold">{data.game.title}</div>
+          </div>
+        </div>
+        <div className="text-sm">
+          <span className="text-slate-500">نمره هفته: </span>
+          <b>{fa(data.game.weekly_score.score)}</b>
+          <span className="text-slate-400"> / ۱۰۰</span>
+          <span className="ms-3 text-slate-500">امتیاز هفته: </span>
+          <b>{fa(data.game.week_points)}</b>
+        </div>
+        {data.habits.length > 0 && (
+          <div className="flex flex-wrap items-center gap-1.5">
+            {data.habits.slice(0, 5).map((h) => (
+              <span key={h.id} className={cx("inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs", h.met_now ? "bg-emerald-50 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300" : "bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300")}>
+                <Flame className={cx("size-3", h.streak ? "text-orange-500" : "text-slate-400")} />
+                {h.title} {h.streak ? fa(h.streak) : ""}
+              </span>
+            ))}
+          </div>
+        )}
+        {data.commitments.length > 0 && (
+          <div className="flex items-center gap-1.5 text-xs text-slate-600 dark:text-slate-300">
+            <HandHeart className="size-4 text-rose-500" />
+            قول‌های امروز: {fa(data.commitments.filter((c) => c.status === "done").length)} از {fa(data.commitments.length)}
+          </div>
+        )}
+        {data.budget && data.budget.limit > 0 && (
+          <div className={cx("ms-auto flex items-center gap-1.5 text-xs", data.budget.over ? "text-rose-600" : "text-slate-500")}>
+            <Wallet className="size-4" /> هزینه امروز: ${data.budget.spent_today.toFixed(2)} از ${data.budget.limit}
+          </div>
+        )}
+      </button>
 
       <div className="grid gap-5 lg:grid-cols-3">
         <div className="space-y-5 lg:col-span-2">

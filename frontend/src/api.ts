@@ -10,10 +10,17 @@ export type ChatMessage = {
   meta: {
     actions?: Action[];
     quick_replies?: string[];
-    attachments?: { type: string; url: string }[];
+    attachments?: { type: string; url: string; name?: string }[];
     voice?: boolean;
     report_id?: number;
     part?: string;
+    turn_id?: string;
+    undoable?: boolean;
+    undone?: boolean;
+    followup_id?: number;
+    snoozed_until?: string;
+    forwarded_from?: string;
+    document_name?: string;
   };
 };
 
@@ -30,10 +37,61 @@ export type Task = {
   progress: number;
   notes: string;
   recurring_event_id: number | null;
+  parent_id: number | null;
+  energy: "high" | "normal" | "low";
   spent_minutes: number;
   remaining_minutes: number;
+  adjusted_estimate_minutes?: number;
+  subtasks_total?: number;
+  subtasks_done?: number;
   completed_at: string | null;
 };
+
+export type Habit = {
+  id: number;
+  title: string;
+  unit: string;
+  unit_fa: string;
+  target: number;
+  period: "daily" | "weekly";
+  reminder_time: string | null;
+  category: string;
+  active: boolean;
+  streak: number;
+  best_streak: number;
+  today: number;
+  period_total: number;
+  met_now: boolean;
+  last7: { date: string; value: number; met: boolean }[];
+};
+
+export type Commitment = {
+  id: number;
+  day: string;
+  text: string;
+  target_minutes: number | null;
+  logged_minutes: number | null;
+  task_id: number | null;
+  task_done: boolean;
+  category: string | null;
+  status: "pending" | "done" | "partial" | "missed";
+  note: string;
+};
+
+export type Game = {
+  level: number;
+  title: string;
+  points: number;
+  level_start: number;
+  next_level_at: number;
+  progress: number;
+  week_points: number;
+  week_breakdown: Record<string, number>;
+  weekly_score: { score: number; components: Record<string, number> };
+  last_week_score: { score: number };
+};
+
+export type Budget = { spent_today: number; limit: number; over: boolean };
 
 export type AgendaItem = {
   type: "class" | "event" | "block" | "deadline";
@@ -116,7 +174,42 @@ export type Dashboard = {
     total_required: number;
     capacity_7d: number;
   };
+  game: Game;
+  habits: Habit[];
+  commitments: Commitment[];
+  budget: Budget | null;
 };
+
+export type Insights = {
+  estimation_text: string[];
+  peak_hours: number[];
+  peak_hours_learned: boolean;
+  hour_profile: number[];
+  reminders: { kinds: Record<string, { sent: number; answered: number; rate: number }>; hours: Record<string, { sent: number; answered: number; rate: number }> };
+  reminders_text: string[];
+  game: Game;
+};
+
+export type Usage = {
+  budget: Budget | null;
+  days: { day: string; cost: number; prompt_tokens: number; completion_tokens: number; calls: number }[];
+  models: { model: string; cost: number; prompt_tokens: number; completion_tokens: number; calls: number; failures: number }[];
+  purposes: { purpose: string; cost: number; calls: number }[];
+  total_cost: number;
+};
+
+export type IeltsPoint = { date: string; band: number; source: string; id: number };
+export type Ielts = {
+  target_band: number;
+  exam_date: string | null;
+  days_left: number | null;
+  series: Record<string, IeltsPoint[]>;
+  latest: Record<string, { last: number; avg_recent: number }>;
+  gaps: Record<string, number>;
+  vocab: { total: number; due_today: number; mastered: number; by_box: Record<string, number> };
+};
+
+export type Vocab = { id: number; word: string; meaning: string; example: string; box: number; due: string; reviews: number; correct: number };
 
 export type Stats = {
   total_productive_minutes: number;
@@ -149,12 +242,28 @@ export type TelegramStatus = {
   owner: { username?: string; name?: string } | null;
   pairing_code: string | null;
   last_error: string | null;
+  outbox?: { pending: number; failed: number; last_error: string | null };
 };
 
 export type SettingsData = {
   prefs: Record<string, unknown>;
   telegram: TelegramStatus;
-  llm: { configured: boolean; base_url: string; chat_model: string; fast_model: string; vision_model: string; transcribe_model: string };
+  llm: {
+    configured: boolean;
+    base_url: string;
+    proxy: boolean;
+    chat_model: string;
+    fast_model: string;
+    vision_model: string;
+    ielts_model: string;
+    transcribe_model: string;
+    tts_model: string;
+    embedding_model: string;
+    fallback_models: string;
+    env_defaults: Record<string, string>;
+  };
+  budget: Budget | null;
+  push: { subscriptions: number };
   timezone: string;
 };
 

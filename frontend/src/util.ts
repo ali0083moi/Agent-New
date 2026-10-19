@@ -140,6 +140,10 @@ export const FOLLOWUP_KIND: Record<string, string> = {
   idle_checkin: "احوال‌پرسی",
   focus_long: "تایمر طولانی",
   custom: "یادآوری",
+  rescue: "حالت نجات",
+  weekly_planning: "برنامه‌ریزی هفتگی",
+  habit_reminder: "یادآوری عادت",
+  vocab_review: "مرور لغت",
 };
 
 export const WEEKDAYS: { key: string; label: string; short: string }[] = [

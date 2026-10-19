@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { Send, CalendarDays, CheckSquare, FileText, LayoutDashboard, Lock, MessageCircle, Settings as SettingsIcon, Sparkles } from "lucide-react";
+import { Send, CalendarDays, CheckSquare, FileText, LayoutDashboard, Lock, MessageCircle, Settings as SettingsIcon, Sparkles, TrendingUp } from "lucide-react";
 import { api, type Me } from "./api";
 import { LiveProvider, useLive } from "./live";
 import { Button, Input, Spinner, Toasts } from "./components/ui";
@@ -8,6 +8,7 @@ import Dashboard from "./pages/Dashboard";
 import Tasks from "./pages/Tasks";
 import Schedule from "./pages/Schedule";
 import Reports from "./pages/Reports";
+import Progress from "./pages/Progress";
 import Settings from "./pages/Settings";
 import { cx, fa, storageGet, storageSet, syncServerClock } from "./util";
 
@@ -16,6 +17,7 @@ const PAGES = [
   { key: "today", label: "امروز", icon: LayoutDashboard },
   { key: "tasks", label: "کارها", icon: CheckSquare },
   { key: "schedule", label: "برنامه", icon: CalendarDays },
+  { key: "progress", label: "پیشرفت", icon: TrendingUp },
   { key: "reports", label: "گزارش", icon: FileText },
   { key: "settings", label: "تنظیمات", icon: SettingsIcon },
 ] as const;
@@ -127,7 +129,7 @@ function Shell({ me, page, go }: { me: Me; page: string; go: (p: string) => void
                 )}
               >
                 <Icon className="size-4.5" />
-                {p.label === "برنامه" ? "برنامه هفتگی" : p.label === "گزارش" ? "گزارش‌ها" : p.label}
+                {p.label === "گزارش" ? "گزارش‌ها" : p.label}
                 {p.key === "chat" && unread > 0 && !active && (
                   <span className="ms-auto rounded-full bg-rose-500 px-1.5 text-[11px] font-bold text-white">{fa(unread)}</span>
                 )}
@@ -154,6 +156,7 @@ function Shell({ me, page, go }: { me: Me; page: string; go: (p: string) => void
           {page === "today" && <Dashboard go={go} />}
           {page === "tasks" && <Tasks />}
           {page === "schedule" && <Schedule go={go} />}
+          {page === "progress" && <Progress />}
           {page === "reports" && <Reports />}
           {page === "settings" && <Settings theme={theme} setTheme={setTheme} />}
         </div>
@@ -161,7 +164,7 @@ function Shell({ me, page, go }: { me: Me; page: string; go: (p: string) => void
         {/* bottom nav (mobile) */}
         <nav
           className={cx(
-            "grid grid-cols-6 border-t border-slate-200/70 bg-white/90 pb-[env(safe-area-inset-bottom)] backdrop-blur md:hidden dark:border-slate-800 dark:bg-slate-950/90",
+            "grid grid-cols-7 border-t border-slate-200/70 bg-white/90 pb-[env(safe-area-inset-bottom)] backdrop-blur md:hidden dark:border-slate-800 dark:bg-slate-950/90",
             page !== "chat" && "fixed inset-x-0 bottom-0 z-40",
           )}
         >

@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState, type ClipboardEvent, type DragEvent } from "react";
-import { BellRing, ImagePlus, Loader2, Mic, Monitor, Send, Sparkles, Square, X } from "lucide-react";
-import type { ChatMessage } from "../api";
+import { AlarmClock, BellRing, FileText, Forward, Loader2, Mic, Monitor, Paperclip, Send, Sparkles, Square, Undo2, Volume2, X } from "lucide-react";
+import { api, type ChatMessage } from "../api";
 import { useLive } from "../live";
 import Markdown from "../components/Markdown";
 import { IconButton } from "../components/ui";
@@ -12,7 +12,9 @@ const SUGGESTIONS = [
   "📷 عکس برنامه کلاسی دانشگاهم رو می‌فرستم",
   "این هفته چند تا کار با ددلاین دارم، برام برنامه بریز",
   "پنجشنبه عصر می‌تونم برم بیرون؟",
-  "امروز چقدر کار مفید کردم؟",
+  "می‌خوام هر روز ۳۰ دقیقه ورزش کنم، پیگیرم باش",
+  "یه سؤال اسپیکینگ پارت ۲ ازم بپرس",
+  "امتحان‌های پایان‌ترمم رو برنامه‌ریزی کن",
 ];
 
 function TelegramIcon({ className }: { className?: string }) {
@@ -35,6 +37,71 @@ function dayLabel(iso: string): string {
   return faDate(d);
 }
 
+let currentAudio: HTMLAudioElement | null = null;
+
+function MessageTools({ m }: { m: ChatMessage }) {
+  const { toast } = useLive();
+  const [busy, setBusy] = useState<string | null>(null);
+  const speak = async () => {
+    setBusy("tts");
+    try {
+      const res = await fetch(`/api/messages/${m.id}/tts`, { credentials: "same-origin" });
+      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || "پخش صدا ممکن نشد");
+      const url = URL.createObjectURL(await res.blob());
+      currentAudio?.pause();
+      currentAudio = new Audio(url);
+      await currentAudio.play();
+    } catch (e) {
+      toast((e as Error).message, "error");
+    } finally {
+      setBusy(null);
+    }
+  };
+  const undo = async () => {
+    if (!confirm("تغییرات این پیام برگردانده شود؟")) return;
+    setBusy("undo");
+    try {
+      const r = await api.post<{ text: string }>(`/api/messages/${m.id}/undo`);
+      toast(r.text, "success");
+    } catch (e) {
+      toast((e as Error).message, "error");
+    } finally {
+      setBusy(null);
+    }
+  };
+  const snooze = async () => {
+    setBusy("snooze");
+    try {
+      const r = await api.post<{ text: string }>(`/api/messages/${m.id}/snooze?minutes=60`);
+      toast(r.text, "success");
+    } catch (e) {
+      toast((e as Error).message, "error");
+    } finally {
+      setBusy(null);
+    }
+  };
+  const btn = "inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] text-slate-500 transition hover:bg-slate-100 hover:text-slate-800 dark:hover:bg-slate-800 dark:hover:text-slate-200";
+  return (
+    <div className="flex flex-wrap items-center gap-0.5 opacity-80">
+      <button className={btn} onClick={speak} disabled={busy !== null} title="پخش صوتی">
+        {busy === "tts" ? <Loader2 className="size-3 animate-spin" /> : <Volume2 className="size-3" />} شنیدن
+      </button>
+      {m.meta?.undoable && !m.meta?.undone && (
+        <button className={btn} onClick={undo} disabled={busy !== null} title="برگرداندن تغییرات این پیام">
+          <Undo2 className="size-3" /> برگردون
+        </button>
+      )}
+      {m.meta?.undone && <span className="px-2 text-[11px] text-slate-400">↩️ برگردانده شد</span>}
+      {m.meta?.followup_id && !m.meta?.snoozed_until && (
+        <button className={btn} onClick={snooze} disabled={busy !== null} title="یک ساعت دیگر دوباره یادآوری کن">
+          <AlarmClock className="size-3" /> یک ساعت دیگه
+        </button>
+      )}
+      {m.meta?.snoozed_until && <span className="px-2 text-[11px] text-slate-400">⏰ تا {faTime(m.meta.snoozed_until)}</span>}
+    </div>
+  );
+}
+
 function Bubble({ m, showQuick, onQuick }: { m: ChatMessage; showQuick: boolean; onQuick: (t: string) => void }) {
   const mine = m.role === "user";
   const proactive = m.role === "assistant" && m.kind !== "chat";
@@ -55,11 +122,22 @@ function Bubble({ m, showQuick, onQuick }: { m: ChatMessage; showQuick: boolean;
             proactive && "border-amber-200 dark:border-amber-500/30",
           )}
         >
-          {m.meta?.attachments?.map((a) => (
-            <a key={a.url} href={a.url} target="_blank" rel="noreferrer">
-              <img src={a.url} alt="" className="mb-2 max-h-64 rounded-2xl object-cover" />
-            </a>
-          ))}
+          {m.meta?.forwarded_from && (
+            <div className={cx("mb-1 flex items-center gap-1 text-xs", mine ? "text-white/80" : "text-slate-500")}>
+              <Forward className="size-3" /> فوروارد از «{m.meta.forwarded_from}»
+            </div>
+          )}
+          {m.meta?.attachments?.map((a) =>
+            a.type === "image" ? (
+              <a key={a.url} href={a.url} target="_blank" rel="noreferrer">
+                <img src={a.url} alt="" className="mb-2 max-h-64 rounded-2xl object-cover" />
+              </a>
+            ) : (
+              <a key={a.url} href={a.url} target="_blank" rel="noreferrer" className={cx("mb-2 flex items-center gap-2 rounded-xl px-3 py-2 text-sm", mine ? "bg-white/15" : "bg-slate-100 dark:bg-slate-800")}>
+                <FileText className="size-4" /> {a.name || "فایل"}
+              </a>
+            ),
+          )}
           {m.meta?.voice && <div className={cx("mb-1 flex items-center gap-1 text-xs", mine ? "text-white/80" : "text-slate-500")}><Mic className="size-3" /> ویس</div>}
           {mine ? <div className="whitespace-pre-wrap leading-7" dir="auto">{m.content}</div> : <Markdown>{m.content}</Markdown>}
         </div>
@@ -91,10 +169,11 @@ function Bubble({ m, showQuick, onQuick }: { m: ChatMessage; showQuick: boolean;
             ))}
           </div>
         )}
-        <div className="flex items-center gap-1 px-1 text-[11px] text-slate-400">
+        <div className="flex flex-wrap items-center gap-1 px-1 text-[11px] text-slate-400">
           {mine && m.channel === "telegram" && <TelegramIcon className="size-3 text-sky-500" />}
           {mine && m.channel === "web" && <Monitor className="size-3" />}
           {faTime(m.created_at)}
+          {!mine && <MessageTools m={m} />}
         </div>
       </div>
     </div>
@@ -102,7 +181,7 @@ function Bubble({ m, showQuick, onQuick }: { m: ChatMessage; showQuick: boolean;
 }
 
 export default function Chat({ assistantName }: { assistantName: string }) {
-  const { messages, typing, sending, send, hasMore, loadOlder, connected, markRead, toast } = useLive();
+  const { messages, typing, sending, send, hasMore, loadOlder, connected, markRead, toast, draft } = useLive();
   const [text, setText] = useState("");
   const [files, setFiles] = useState<File[]>([]);
   const [recording, setRecording] = useState(false);
@@ -116,15 +195,15 @@ export default function Chat({ assistantName }: { assistantName: string }) {
 
   useEffect(() => markRead(), [messages.length, markRead]);
   useEffect(() => {
-    const urls = files.map((f) => URL.createObjectURL(f));
+    const urls = files.map((f) => (f.type.startsWith("image/") ? URL.createObjectURL(f) : `file:${f.name}`));
     setPreviews(urls);
-    return () => urls.forEach((u) => URL.revokeObjectURL(u));
+    return () => urls.forEach((u) => u.startsWith("blob:") && URL.revokeObjectURL(u));
   }, [files]);
 
   useLayoutEffect(() => {
     const el = scrollRef.current;
     if (el && nearBottom.current) el.scrollTop = el.scrollHeight;
-  }, [messages, typing, sending]);
+  }, [messages, typing, sending, draft]);
 
   useEffect(() => {
     const open = () => fileRef.current?.click();
@@ -161,8 +240,11 @@ export default function Chat({ assistantName }: { assistantName: string }) {
 
   const addImages = (list: FileList | File[] | null) => {
     if (!list) return;
-    const imgs = [...list].filter((f) => f.type.startsWith("image/"));
-    if (imgs.length) setFiles((prev) => [...prev, ...imgs].slice(0, 4));
+    const ok = [...list].filter(
+      (f) => f.type.startsWith("image/") || f.type === "application/pdf" || f.type.startsWith("text/") || /\.(pdf|txt|md|csv)$/i.test(f.name),
+    );
+    if (ok.length < list.length) toast("فقط عکس، PDF و فایل متنی پشتیبانی می‌شود", "error");
+    if (ok.length) setFiles((prev) => [...prev, ...ok].slice(0, 4));
   };
 
   const onPaste = (e: ClipboardEvent<HTMLTextAreaElement>) => {
@@ -286,7 +368,20 @@ export default function Chat({ assistantName }: { assistantName: string }) {
             </div>
           );
         })}
-        {(typing || sending) && (
+        {draft && (draft.text || draft.status) && (typing || sending) ? (
+          <div className="flex justify-start">
+            <div className="flex max-w-[88%] flex-col gap-1 sm:max-w-[75%]">
+              <div className="rounded-3xl rounded-es-md border border-slate-200/70 bg-white px-4 py-2.5 text-[15px] shadow-[var(--shadow-soft)] dark:border-slate-800 dark:bg-slate-900">
+                {draft.text ? <Markdown>{draft.text + " ▍"}</Markdown> : null}
+                {draft.status && (
+                  <div className="flex items-center gap-2 text-xs text-slate-500">
+                    <Loader2 className="size-3 animate-spin" /> {draft.status}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        ) : (typing || sending) && (
           <div className="flex justify-start">
             <div className="flex items-center gap-1.5 rounded-3xl rounded-es-md border border-slate-200/70 bg-white px-4 py-3.5 dark:border-slate-800 dark:bg-slate-900">
               {[0, 1, 2].map((i) => (
@@ -302,8 +397,15 @@ export default function Chat({ assistantName }: { assistantName: string }) {
         {previews.length > 0 && (
           <div className="mb-2 flex gap-2">
             {previews.map((u, i) => (
-              <div key={u} className="relative">
-                <img src={u} alt="" className="size-16 rounded-xl object-cover" />
+              <div key={u + i} className="relative">
+                {u.startsWith("file:") ? (
+                  <div className="flex size-16 flex-col items-center justify-center gap-1 rounded-xl bg-slate-100 p-1 text-center text-[10px] dark:bg-slate-800">
+                    <FileText className="size-5 text-slate-500" />
+                    <span className="line-clamp-2 break-all">{u.slice(5)}</span>
+                  </div>
+                ) : (
+                  <img src={u} alt="" className="size-16 rounded-xl object-cover" />
+                )}
                 <button onClick={() => setFiles((f) => f.filter((_, j) => j !== i))} className="absolute -end-1.5 -top-1.5 rounded-full bg-slate-900 p-0.5 text-white">
                   <X className="size-3" />
                 </button>
@@ -312,9 +414,9 @@ export default function Chat({ assistantName }: { assistantName: string }) {
           </div>
         )}
         <div className="flex items-end gap-2">
-          <input ref={fileRef} type="file" accept="image/*" multiple hidden onChange={(e) => { addImages(e.target.files); e.target.value = ""; }} />
-          <IconButton title="ارسال عکس (مثلاً برنامه کلاسی)" onClick={() => fileRef.current?.click()}>
-            <ImagePlus className="size-5" />
+          <input ref={fileRef} type="file" accept="image/*,application/pdf,.pdf,.txt,.md,.csv" multiple hidden onChange={(e) => { addImages(e.target.files); e.target.value = ""; }} />
+          <IconButton title="پیوست عکس یا PDF (برنامه کلاسی، سرفصل، تکلیف، رایتینگ)" onClick={() => fileRef.current?.click()}>
+            <Paperclip className="size-5" />
           </IconButton>
           <div className="flex min-h-11 flex-1 items-center rounded-2xl border border-slate-200 bg-white px-3 focus-within:border-brand-400 focus-within:ring-4 focus-within:ring-brand-500/10 dark:border-slate-700 dark:bg-slate-900">
             <textarea

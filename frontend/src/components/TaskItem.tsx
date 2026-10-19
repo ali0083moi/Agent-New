@@ -1,9 +1,10 @@
 import { useState } from "react";
-import { Check, Clock, Pencil, Play, Trash2 } from "lucide-react";
+import { Check, Clock, Layers, Pencil, Play, Trash2, Zap } from "lucide-react";
 import { api, type Task } from "../api";
 import { useLive } from "../live";
-import { CATEGORY, cx, duration, fa, faDateTime, fromInputDateTime, relative, toInputDateTime } from "../util";
-import { Button, CategoryBadge, Field, IconButton, Input, Modal, ProgressBar, Select } from "./ui";
+import { CATEGORY, cx, duration, fa, faDateTime, relative } from "../util";
+import { JalaliInput } from "./JalaliPicker";
+import { Button, CategoryBadge, Field, IconButton, Input, Modal, ProgressBar, Segmented, Select } from "./ui";
 
 const PRIORITY = [
   { value: "1", label: "🔴 بالا" },
@@ -11,7 +12,7 @@ const PRIORITY = [
   { value: "3", label: "⚪ پایین" },
 ];
 
-export function TaskItem({ task, compact }: { task: Task; compact?: boolean }) {
+export function TaskItem({ task, compact, nested }: { task: Task; compact?: boolean; nested?: boolean }) {
   const { toast, bump } = useLive();
   const [editing, setEditing] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -64,7 +65,17 @@ export function TaskItem({ task, compact }: { task: Task; compact?: boolean }) {
             {task.title}
           </button>
           {task.priority === 1 && !done && <span className="text-xs text-rose-500">● مهم</span>}
-          {!compact && <CategoryBadge category={task.category} />}
+          {task.energy === "high" && !done && (
+            <span className="inline-flex items-center text-xs text-amber-600 dark:text-amber-400" title="کار عمیق">
+              <Zap className="size-3" />
+            </span>
+          )}
+          {!compact && !nested && <CategoryBadge category={task.category} />}
+          {task.subtasks_total ? (
+            <span className="inline-flex items-center gap-1 rounded-lg bg-brand-50 px-1.5 py-0.5 text-[11px] text-brand-700 dark:bg-brand-500/15 dark:text-brand-200">
+              <Layers className="size-3" /> {fa(task.subtasks_done ?? 0)}/{fa(task.subtasks_total)}
+            </span>
+          ) : null}
         </div>
         <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-500 dark:text-slate-400">
           {task.due && (
@@ -80,7 +91,12 @@ export function TaskItem({ task, compact }: { task: Task; compact?: boolean }) {
               {compact ? rel.text : `${faDateTime(task.due)} · ${rel.text}`}
             </span>
           )}
-          {!done && <span>باقی‌مانده: {duration(task.remaining_minutes)}</span>}
+          {!done && (
+            <span title={task.adjusted_estimate_minutes ? `تخمین تو ${duration(task.estimated_minutes)} بود؛ از روی سابقه‌ات ${duration(task.adjusted_estimate_minutes)} حساب شده` : undefined}>
+              باقی‌مانده: {duration(task.remaining_minutes)}
+              {task.adjusted_estimate_minutes ? " 📈" : ""}
+            </span>
+          )}
           {task.spent_minutes > 0 && <span>صرف‌شده: {duration(task.spent_minutes)}</span>}
         </div>
         {task.progress > 0 && !done && (
@@ -111,7 +127,8 @@ export function TaskEditor({ task, onClose }: { task?: Task; onClose: () => void
   const [description, setDescription] = useState(task?.description ?? "");
   const [category, setCategory] = useState(task?.category ?? "personal");
   const [priority, setPriority] = useState(String(task?.priority ?? 2));
-  const [due, setDue] = useState(toInputDateTime(task?.due));
+  const [due, setDue] = useState<string | null>(task?.due ?? null);
+  const [energy, setEnergy] = useState<"high" | "normal" | "low">(task?.energy ?? "normal");
   const [estimate, setEstimate] = useState(task?.estimated_minutes ? String(task.estimated_minutes) : "");
   const [progress, setProgress] = useState(task?.progress ?? 0);
   const [busy, setBusy] = useState(false);
@@ -124,15 +141,16 @@ export function TaskEditor({ task, onClose }: { task?: Task; onClose: () => void
       description,
       category,
       priority: Number(priority),
+      energy,
       estimated_minutes: estimate ? Number(estimate) : undefined,
     };
     try {
       if (task) {
-        body.due = due ? fromInputDateTime(due) : "none";
+        body.due = due ?? "none";
         body.progress = progress;
         await api.patch(`/api/tasks/${task.id}`, body);
       } else {
-        if (due) body.due = fromInputDateTime(due);
+        if (due) body.due = due;
         await api.post("/api/tasks", body);
       }
       bump("tasks", "followups");
@@ -191,13 +209,27 @@ export function TaskEditor({ task, onClose }: { task?: Task; onClose: () => void
           <Field label="اولویت">
             <Select value={priority} onChange={setPriority} options={PRIORITY} />
           </Field>
-          <Field label="ددلاین" hint={due ? faDateTime(fromInputDateTime(due)) : "اختیاری"}>
-            <Input type="datetime-local" value={due} onChange={(e) => setDue(e.target.value)} />
+          <Field label="ددلاین" hint={due ? faDateTime(due) : "اختیاری"}>
+            <JalaliInput value={due} onChange={setDue} />
           </Field>
-          <Field label="زمان تخمینی (دقیقه)">
+          <Field
+            label="زمان تخمینی (دقیقه)"
+            hint={task?.adjusted_estimate_minutes ? `از روی سابقه‌ات: ${duration(task.adjusted_estimate_minutes)}` : undefined}
+          >
             <Input type="number" min={5} step={5} value={estimate} onChange={(e) => setEstimate(e.target.value)} placeholder="۶۰" />
           </Field>
         </div>
+        <Field label="نوع کار" hint="کارهای عمیق در ساعت‌های اوج تمرکزت چیده می‌شوند">
+          <Segmented
+            value={energy}
+            onChange={setEnergy}
+            options={[
+              { value: "high", label: "⚡ عمیق" },
+              { value: "normal", label: "معمولی" },
+              { value: "low", label: "سبک" },
+            ]}
+          />
+        </Field>
         {task && (
           <Field label={`پیشرفت: ${fa(progress)}٪`}>
             <input type="range" min={0} max={100} step={5} value={progress} onChange={(e) => setProgress(Number(e.target.value))} className="w-full accent-brand-600" />

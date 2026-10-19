@@ -3,7 +3,10 @@ import { api, type ChatMessage } from "./api";
 
 type Toast = { id: number; text: string; tone: "info" | "error" | "success" };
 
+export type Draft = { turn_id: string; text: string; status?: string };
+
 type LiveCtx = {
+  draft: Draft | null;
   messages: ChatMessage[];
   hasMore: boolean;
   loadOlder: () => Promise<void>;
@@ -32,6 +35,7 @@ export function LiveProvider({ children, activePage }: { children: ReactNode; ac
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [hasMore, setHasMore] = useState(false);
   const [typing, setTyping] = useState(false);
+  const [draft, setDraft] = useState<Draft | null>(null);
   const [sending, setSending] = useState(false);
   const [connected, setConnected] = useState(false);
   const [version, setVersion] = useState<Record<string, number>>({});
@@ -77,10 +81,18 @@ export function LiveProvider({ children, activePage }: { children: ReactNode; ac
           const { event, data } = JSON.parse(ev.data);
           if (event === "message") {
             setMessages((prev) => merge(prev, [data as ChatMessage]));
+            if (data.role === "assistant" && data.meta?.turn_id) setDraft((d) => (d && d.turn_id === data.meta.turn_id ? null : d));
             if (data.role === "assistant" && pageRef.current !== "chat") setUnread((u) => u + 1);
             if (data.role === "assistant") bump("messages");
           } else if (event === "typing") {
             setTyping(Boolean(data));
+            if (!data) setDraft(null);
+          } else if (event === "stream") {
+            setDraft((d) => ({
+              turn_id: data.turn_id,
+              text: data.text ?? (d && d.turn_id === data.turn_id ? d.text : ""),
+              status: data.status ?? (data.text ? undefined : d?.status),
+            }));
           } else if (event === "data_changed") {
             bump(...(data as string[]));
           }
@@ -122,6 +134,7 @@ export function LiveProvider({ children, activePage }: { children: ReactNode; ac
 
   const value = useMemo<LiveCtx>(
     () => ({
+      draft,
       messages,
       hasMore,
       loadOlder,
@@ -136,7 +149,7 @@ export function LiveProvider({ children, activePage }: { children: ReactNode; ac
       unread,
       markRead: () => setUnread(0),
     }),
-    [messages, hasMore, loadOlder, typing, sending, send, version, bump, connected, toast, toasts, unread],
+    [draft, messages, hasMore, loadOlder, typing, sending, send, version, bump, connected, toast, toasts, unread],
   );
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }

@@ -8,7 +8,9 @@ import { CATEGORY, cx, fa, parseLocal, serverNow } from "../util";
 
 type Group = { key: string; title: string; tasks: Task[] };
 
-function groupTasks(tasks: Task[]): Group[] {
+function groupTasks(all: Task[]): Group[] {
+  const ids = new Set(all.map((t) => t.id));
+  const tasks = all.filter((t) => !t.parent_id || !ids.has(t.parent_id)); // subtasks render under their project
   const now = serverNow();
   const endToday = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
   const endWeek = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 7);
@@ -88,9 +90,21 @@ export default function Tasks() {
             }
           >
             <div className="-mx-2 space-y-0.5">
-              {g.tasks.map((t) => (
-                <TaskItem key={t.id} task={t} />
-              ))}
+              {g.tasks.map((t) => {
+                const kids = (data?.tasks ?? []).filter((k) => k.parent_id === t.id);
+                return (
+                  <div key={t.id}>
+                    <TaskItem task={t} />
+                    {kids.length > 0 && (
+                      <div className="ms-6 border-s-2 border-brand-100 ps-2 dark:border-brand-500/20">
+                        {kids.map((k) => (
+                          <TaskItem key={k.id} task={k} nested />
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
             </div>
           </Card>
         ))

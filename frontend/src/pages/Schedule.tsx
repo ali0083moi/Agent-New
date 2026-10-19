@@ -1,88 +1,11 @@
 import { useMemo, useState } from "react";
 import { BellRing, Camera, ChevronLeft, ChevronRight, GraduationCap, Pencil, Plus, Trash2, Wand2 } from "lucide-react";
-import { api, type AgendaDay, type AgendaItem, type Recurring } from "../api";
+import { api, type AgendaDay, type Recurring } from "../api";
 import { useData, useLive } from "../live";
 import { Badge, Button, Card, Empty, Field, IconButton, Input, Modal, Segmented, Select, Toggle } from "../components/ui";
 import { Timeline } from "../components/widgets";
-import { addDays, cx, fa, faDate, faTime, isoDate, parseLocal, serverNow, WEEKDAYS, weekStart } from "../util";
-
-const START_H = 7;
-const END_H = 24;
-const HOUR_PX = 46;
-
-const ITEM_STYLE: Record<string, string> = {
-  class: "bg-violet-100 border-violet-300 text-violet-900 dark:bg-violet-500/20 dark:border-violet-500/40 dark:text-violet-100",
-  event: "bg-amber-100 border-amber-300 text-amber-900 dark:bg-amber-500/20 dark:border-amber-500/40 dark:text-amber-100",
-  block: "bg-emerald-50 border-emerald-300 border-dashed text-emerald-900 dark:bg-emerald-500/10 dark:border-emerald-500/40 dark:text-emerald-100",
-  deadline: "bg-rose-500 border-rose-600 text-white",
-};
-
-function minutesOf(s: string): number {
-  const d = parseLocal(s)!;
-  return d.getHours() * 60 + d.getMinutes();
-}
-
-function WeekGrid({ days }: { days: AgendaDay[] }) {
-  const todayIso = isoDate(serverNow());
-  const now = serverNow();
-  const nowMin = now.getHours() * 60 + now.getMinutes();
-  const hours = Array.from({ length: END_H - START_H }, (_, i) => START_H + i);
-  return (
-    <div className="card overflow-x-auto p-0">
-      <div className="min-w-[760px]">
-        <div className="grid grid-cols-[52px_repeat(7,1fr)] border-b border-slate-200 dark:border-slate-800">
-          <div />
-          {days.map((d) => (
-            <div key={d.date} className={cx("px-2 py-2.5 text-center", d.date === todayIso && "bg-brand-50/70 dark:bg-brand-500/10")}>
-              <div className={cx("text-sm font-bold", d.date === todayIso && "text-brand-600 dark:text-brand-300")}>{d.weekday_fa}</div>
-              <div className="text-xs text-slate-500">{faDate(d.date, true)}</div>
-            </div>
-          ))}
-        </div>
-        <div className="relative grid grid-cols-[52px_repeat(7,1fr)]" style={{ height: (END_H - START_H) * HOUR_PX }}>
-          <div className="relative">
-            {hours.map((h) => (
-              <div key={h} className="absolute end-2 -translate-y-2 text-[11px] text-slate-400" style={{ top: (h - START_H) * HOUR_PX }}>
-                {fa(String(h).padStart(2, "0"))}:۰۰
-              </div>
-            ))}
-          </div>
-          {days.map((d) => (
-            <div key={d.date} className={cx("relative border-s border-slate-100 dark:border-slate-800/80", d.date === todayIso && "bg-brand-50/40 dark:bg-brand-500/5")}>
-              {hours.map((h) => (
-                <div key={h} className="absolute inset-x-0 border-t border-slate-100 dark:border-slate-800/60" style={{ top: (h - START_H) * HOUR_PX }} />
-              ))}
-              {d.date === todayIso && nowMin >= START_H * 60 && (
-                <div className="absolute inset-x-0 z-20 h-0.5 bg-rose-500" style={{ top: ((nowMin - START_H * 60) / 60) * HOUR_PX }}>
-                  <span className="absolute -start-1 -top-1 size-2.5 rounded-full bg-rose-500" />
-                </div>
-              )}
-              {d.items.map((it: AgendaItem, i) => {
-                const s = Math.max(minutesOf(it.start), START_H * 60);
-                const sameDay = it.end.slice(0, 10) === d.date;
-                const e = it.type === "deadline" ? s + 22 : sameDay ? Math.min(minutesOf(it.end), END_H * 60) : END_H * 60;
-                if (e <= START_H * 60) return null;
-                const top = ((s - START_H * 60) / 60) * HOUR_PX;
-                const height = Math.max(((e - s) / 60) * HOUR_PX - 2, 20);
-                return (
-                  <div
-                    key={`${it.type}-${it.ref_id}-${i}`}
-                    title={`${it.title} · ${faTime(it.start)}${it.type !== "deadline" ? " تا " + faTime(it.end) : ""}`}
-                    className={cx("absolute inset-x-1 z-10 overflow-hidden rounded-lg border px-1.5 py-1 text-[11px] leading-4", ITEM_STYLE[it.type])}
-                    style={{ top, height }}
-                  >
-                    <div className="truncate font-semibold">{it.type === "deadline" ? "⏰ " : ""}{it.title}</div>
-                    {height > 32 && <div className="truncate opacity-75">{faTime(it.start)}{it.type !== "deadline" && ` - ${faTime(it.end)}`}</div>}
-                  </div>
-                );
-              })}
-            </div>
-          ))}
-        </div>
-      </div>
-    </div>
-  );
-}
+import { MonthView, WeekGrid } from "../components/Calendar";
+import { addDays, cx, fa, faDate, isoDate, serverNow, WEEKDAYS, weekStart } from "../util";
 
 const KINDS = [
   { value: "university_class", label: "کلاس دانشگاه" },
@@ -211,11 +134,12 @@ function RecurringEditor({ rec, onClose }: { rec?: Recurring; onClose: () => voi
 
 export default function Schedule({ go }: { go: (page: string) => void }) {
   const [offset, setOffset] = useState(0);
+  const [mode, setMode] = useState<"week" | "month">("week");
   const [editing, setEditing] = useState<Recurring | null | "new">(null);
   const [planning, setPlanning] = useState(false);
   const { toast, bump } = useLive();
   const start = useMemo(() => addDays(weekStart(serverNow()), offset * 7), [offset]);
-  const { data } = useData<{ days: AgendaDay[] }>(`/api/agenda?start=${isoDate(start)}&days=7`, ["schedule", "tasks"]);
+  const { data, reload } = useData<{ days: AgendaDay[] }>(`/api/agenda?start=${isoDate(start)}&days=7`, ["schedule", "tasks"]);
   const recs = useData<{ recurring: Recurring[] }>("/api/recurring", ["schedule"]);
   const end = addDays(start, 6);
 
@@ -241,13 +165,14 @@ export default function Schedule({ go }: { go: (page: string) => void }) {
     <div className="mx-auto max-w-7xl space-y-5 p-4 sm:p-6">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
-          <h1 className="text-2xl font-black">برنامه هفتگی</h1>
+          <h1 className="text-2xl font-black">برنامه</h1>
           <p className="text-sm text-slate-500 dark:text-slate-400">
-            {faDate(start, true)} تا {faDate(end, true)}
+            {mode === "week" ? `${faDate(start, true)} تا ${faDate(end, true)} · بلوک‌ها و رویدادها را بکش تا جابه‌جا شوند، روی جای خالی بزن تا چیزی اضافه کنی` : "نمای ماهانه"}
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <div className="flex items-center rounded-xl border border-slate-200 bg-white dark:border-slate-700 dark:bg-slate-900">
+          <Segmented value={mode} onChange={setMode} options={[{ value: "week", label: "هفته" }, { value: "month", label: "ماه" }]} />
+          <div className={cx("flex items-center rounded-xl border border-slate-200 bg-white dark:border-slate-700 dark:bg-slate-900", mode !== "week" && "hidden")}>
             <IconButton title="هفته قبل" onClick={() => setOffset((o) => o - 1)}>
               <ChevronRight className="size-5" />
             </IconButton>
@@ -274,10 +199,11 @@ export default function Schedule({ go }: { go: (page: string) => void }) {
         <span className="flex items-center gap-1.5"><span className="size-3 rounded bg-rose-500" /> ددلاین</span>
       </div>
 
-      {data && (
+      {mode === "month" && <MonthView />}
+      {mode === "week" && data && (
         <>
           <div className="hidden md:block">
-            <WeekGrid days={data.days} />
+            <WeekGrid days={data.days} onChanged={reload} />
           </div>
           <div className="space-y-3 md:hidden">
             {data.days.map((d) => (

@@ -502,3 +502,18 @@ def test_api_new_endpoints(fake_llm):
         assert c.delete(f"/api/tasks/{t['id']}").json() == {"deleted": t["id"]}
         key = c.get("/api/push/key").json()["public_key"]
         assert key
+
+
+def test_eval_harness_runs_with_scripted_model(tmp_path, fake_llm):
+    from app import evals
+
+    def by_model(messages, tools):
+        assert fake_llm.calls[-1]["model"] == "model-x"
+        return call("add_event", title="دندون‌پزشکی", start="1405-08-05 10:00", duration_minutes=60)
+
+    fake_llm.script = [by_model, ChatResult(content="✅ دندون‌پزشکی سه‌شنبه ۵ آبان ساعت ۱۰ ثبت شد")]
+    jalali = next(s for s in evals.SCENARIOS if s.name == "jalali")
+    res = run(evals.run_scenario(jalali, "model-x"))
+    assert res["passed"] == res["total"] == 2
+    report = evals.render([res])
+    assert "model-x" in report and "2/2" in report

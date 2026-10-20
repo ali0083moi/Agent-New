@@ -2,6 +2,8 @@ import { useEffect, useMemo, useState } from "react";
 import { Briefcase, Copy, Download, FileText, Sparkles, Trash2, User } from "lucide-react";
 import { api, type Report, type Stats } from "../api";
 import { useData, useLive } from "../live";
+import { useProjects } from "../components/Projects";
+import { Select } from "../components/ui";
 import Markdown from "../components/Markdown";
 import { Button, Card, Empty, IconButton, Segmented, Spinner, Stat } from "../components/ui";
 import { CategoryBars, WeekBars } from "../components/widgets";
@@ -13,6 +15,9 @@ export default function Reports() {
   const [selected, setSelected] = useState<number | null>(null);
   const [part, setPart] = useState<"work" | "personal">("work");
   const [busy, setBusy] = useState<number | null>(null);
+  const projects = useProjects();
+  const [projectId, setProjectId] = useState("");
+  const projectName = (id: number | null) => projects.data?.projects.find((p) => p.id === id)?.name;
   const reports = useMemo(() => data?.reports ?? [], [data]);
   const current = reports.find((r) => r.id === selected) ?? reports[0];
   useEffect(() => {
@@ -25,7 +30,10 @@ export default function Reports() {
   const generate = async (offset: number) => {
     setBusy(offset);
     try {
-      const r = await api.post<{ report: Report }>("/api/reports/generate", { week_offset: offset });
+      const r = await api.post<{ report: Report }>("/api/reports/generate", {
+        week_offset: offset,
+        project_id: projectId ? Number(projectId) : undefined,
+      });
       bump("reports");
       setSelected(r.report.id);
       toast("گزارش آماده شد ✨", "success");
@@ -66,7 +74,13 @@ export default function Reports() {
           <h1 className="text-2xl font-black">گزارش‌های هفتگی</h1>
           <p className="text-sm text-slate-500 dark:text-slate-400">یک نسخه رسمی برای کارفرما + یک مرور صادقانه برای خودت.</p>
         </div>
-        <div className="flex gap-2">
+        <div className="flex flex-wrap gap-2">
+          <Select
+            className="w-48"
+            value={projectId}
+            onChange={setProjectId}
+            options={[{ value: "", label: "همه کارها + مرور شخصی" }, ...(projects.data?.projects ?? []).map((p) => ({ value: String(p.id), label: `فقط پروژه ${p.name}` }))]}
+          />
           <Button variant="outline" onClick={() => generate(-1)} loading={busy === -1}>
             هفته قبل
           </Button>
@@ -105,6 +119,7 @@ export default function Reports() {
                       )}
                     >
                       {r.label}
+                      {r.project_id && <span className="block text-[11px] text-slate-500">📁 {projectName(r.project_id) ?? "پروژه"}</span>}
                     </button>
                   </li>
                 ))}

@@ -6,6 +6,7 @@ import asyncio
 import io
 import json
 import logging
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -79,6 +80,10 @@ TOOL_LABELS = {
     "log_ielts_score": "📈 نمره آیلتس",
     "add_vocab": "📇 لغت",
     "vocab_review": "📇 مرور لغت",
+    "add_project": "📁 پروژه",
+    "update_project": "📁 ویرایش پروژه",
+    "add_contact": "🎓 استاد",
+    "update_contact": "🎓 پیگیری استاد",
 }
 STATUS_LABELS = {
     "grade_ielts_writing": "در حال تصحیح رایتینگ…",
@@ -89,7 +94,20 @@ STATUS_LABELS = {
     "plan_exam_prep": "در حال چیدن برنامه امتحان…",
 }
 READ_ONLY = {"get_agenda", "list_tasks", "list_recurring_events", "get_stats", "list_followups", "list_habits",
-             "list_commitments", "ielts_progress", "vocab_due", "get_insights", "rescue_plan", "check_availability"}
+             "list_commitments", "ielts_progress", "vocab_due", "get_insights", "rescue_plan", "check_availability",
+             "list_projects", "list_contacts", "start_speaking_practice"}
+
+# the reply says something was stored, although nothing was
+CLAIM_RE = re.compile(
+    r"(ثبت (شد|شدن|کردم)|ذخیره (شد|شدن|کردم)|اضافه (شد|کردم)|به ?خاطر (سپردم|می‌سپارم)|یادم (می‌مونه|موند|میمونه)|"
+    r"یادداشت (کردم|شد)|تنظیم (شد|کردم)|\bsaved\b|\badded\b|\bnoted\b)"
+)
+VERIFY_NOTE = (
+    "[system check — not from the user] Your reply says something was saved/added/remembered, but NO tool call "
+    "succeeded in this turn, so nothing was stored. Call the needed tools now (remember / add_project / add_task / "
+    "add_event / ...) with correct arguments, then reply. If nothing needed saving, rewrite your reply without "
+    "claiming that you saved anything."
+)
 
 DeltaCallback = Callable[[str], Awaitable[None]]
 
@@ -244,11 +262,22 @@ async def run_agent(
     actions: list[dict[str, Any]] = []
     schemas = tools.schemas()
     stream = _Throttle(on_delta, 0.12) if on_delta else None
+    verified = False
     try:
         for _ in range(MAX_STEPS):
             res = await llm.chat(messages, tools=schemas, model=model, on_delta=stream)
             if not res.tool_calls:
-                return res.content.strip(), actions, ctx.changed
+                reply = res.content.strip()
+                stored = any(a["ok"] and a["tool"] not in READ_ONLY for a in actions)
+                if not verified and not stored and CLAIM_RE.search(reply):
+                    verified = True  # one corrective round at most
+                    log.info("reply claimed a save without any successful tool call; asking the model to act")
+                    messages.append({"role": "assistant", "content": reply})
+                    messages.append({"role": "user", "content": VERIFY_NOTE})
+                    if on_status is not None:
+                        await on_status("در حال ثبت…")
+                    continue
+                return reply, actions, ctx.changed
             messages.append(res.raw_message)
             for call in res.tool_calls:
                 try:

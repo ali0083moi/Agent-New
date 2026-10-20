@@ -14,6 +14,16 @@ You talk with the user in Persian (Farsi), casually and warmly — like a smart,
 short and to the point (this is a chat on Telegram / a web app). Use Persian digits for numbers in your replies.
 The user may write in Finglish or English; always answer in Persian unless asked otherwise.
 
+## Ground rules for tools (very important)
+- Saving happens ONLY through tool calls. Never say «ثبت شد/ذخیره کردم/یادم می‌مونه» unless a tool call in this turn
+  succeeded. If the user tells you facts about themselves, call `remember` (one call per fact) right away.
+- Never invent ids. Use only ids that appear in the context below or in tool results. Refer to projects and
+  professors by NAME (`project="پروژه ماشین"`, `contact="Dr. X"`) — the server resolves names and nicknames.
+- Dates: pass 'YYYY-MM-DD HH:MM' (use the calendar below). "امشب/تا آخر امشب" = today 23:59; "قبل از <روز>" =
+  the day before at 23:59; a Gregorian month name (نوامبر، دسامبر…) is a Gregorian date, a Persian one (آبان…) Jalali.
+- If a tool returns an error or warnings, fix the arguments and call it again in the same turn; don't give up and
+  don't blame "a technical problem" unless it fails twice.
+
 ## Your job
 - Know the user's goals (e.g. IELTS), classes (university + language), work, tasks and deadlines, and keep them on track.
 - Capture EVERYTHING: whenever the user mentions something to do, a homework, a deadline, an exam, a meeting, an
@@ -39,6 +49,13 @@ The user may write in Finglish or English; always answer in Persian unless asked
   If odd/even weeks are used and you don't know which week this is, ask "این هفته فرده یا زوج؟" and save it with
   update_preferences(current_week_parity).
 - Remember long-term facts about the user with `remember` (job, employer, people, routines, preferences, study goals).
+- Projects: when the user mentions a project (company projects, freelance/side projects), register it once with
+  add_project including every nickname they use ("tahami supercars" = «پروژه ماشین»), then always link tasks and
+  logged time with project="<name or nickname>". Weekly reports can be made per project for that project's client
+  (weekly_report(project=...)).
+- Applying / supervisor search (پیدا کردن استاد): track each professor with add_contact (university, research
+  field, email). When the user says they emailed someone, update_contact(status="contacted") — a follow-up is then
+  scheduled automatically. Help draft tailored cold emails and follow-ups in English, and keep the pipeline moving.
 - Weekly report: use weekly_report; it creates two parts: a professional work report for the employer and a personal
   review. Show both.
 - Forwarded messages (e.g. from a class group / professor / manager) and attached files (PDF syllabus, assignment
@@ -113,6 +130,30 @@ def build_context(s: Session) -> str:
     lines.append("\n## What you know about the user (memories)")
     lines += [f"- [m{m.id}] ({m.category}) {m.content}" for m in mems] or ["- (nothing yet)"]
 
+    from ..db import Project
+    from .. import projects as projects_mod
+
+    projs = s.query(Project).filter(Project.status != "done").all()
+    lines.append("\n## Projects (refer to them by name or nickname)")
+    for pr in projs:
+        d = projects_mod.project_dict(s, pr)
+        lines.append(
+            f"- [project {pr.id}] {pr.name}" + (f" — nicknames: {', '.join(pr.aliases)}" if pr.aliases else "")
+            + f" | {pr.category}" + (f" | client: {pr.client}" if pr.client else "") + f" | {pr.status}"
+            + f" | open tasks {d['open_tasks']}, this week {d['minutes_this_week']} min"
+        )
+    if not projs:
+        lines.append("- (none yet — when the user mentions a project, register it with add_project + nicknames)")
+    pipe = projects_mod.pipeline(s)
+    if pipe["contacts"]:
+        lines.append("\n## Supervisor search (contacts)")
+        for c in pipe["contacts"][:25]:
+            lines.append(
+                f"- [contact {c['id']}] {c['name']} ({c['organization']}) — {c['status']}"
+                + (f", last contact {c['last_contact']}" if c["last_contact"] else "")
+                + (f", follow-up {c['next_followup']}" if c["next_followup"] else "")
+            )
+
     goals = s.query(Goal).filter(Goal.status == "active").all()
     lines.append("\n## Active goals")
     lines += [
@@ -152,6 +193,7 @@ def build_context(s: Session) -> str:
             + (f" | {t.progress}%" if t.progress else "")
             + (f" | energy {t.energy}" if t.energy != "normal" else "")
             + (f" | subtask of {t.parent_id}" if t.parent_id else "")
+            + (f" | project {t.project_id}" if t.project_id else "")
             + (f" | class {t.recurring_event_id}" if t.recurring_event_id else "")
         )
     if not tasks:

@@ -43,6 +43,8 @@ DEFAULTS: dict[str, Any] = {
     "semantic_memory": True,
     "auto_facts": True,
     "adaptive_reminders": True,
+    # applying / supervisor search
+    "professor_followup_days": 10,
     # IELTS coach
     "ielts_target_band": 7.0,
     "ielts_exam_date": None,

@@ -21,11 +21,14 @@ def week_bounds(offset: int = 0, ref: date | None = None) -> tuple[date, date]:
     return ws, ws + timedelta(days=6)
 
 
-def collect(week_start: date, week_end: date) -> dict[str, Any]:
+def collect(week_start: date, week_end: date, project_id: int | None = None) -> dict[str, Any]:
+    from .db import Project
+
     with session() as s:
         p = prefs.all_prefs(s)
         st = stats.productivity(s, week_start, week_end)
         work_cats = set(p.get("work_report_categories") or ["work"])
+        project = s.get(Project, project_id) if project_id else None
         nxt_start = timeutil.at(week_end + timedelta(days=1), "00:00")
         upcoming = (
             s.query(Task)
@@ -37,6 +40,7 @@ def collect(week_start: date, week_end: date) -> dict[str, Any]:
             {
                 "title": t.title,
                 "category": t.category,
+                "project_id": t.project_id,
                 "due": timeutil.iso(t.due_at),
                 "progress": t.progress,
                 "remaining_minutes": planner.remaining_minutes(s, t),
@@ -54,17 +58,25 @@ def collect(week_start: date, week_end: date) -> dict[str, Any]:
         points = gamify.points_between(s, week_start, week_end)
         habit_list = habits.all_habits(s)
         ielts_progress = ielts.progress(s)
+        def is_work(item: dict[str, Any]) -> bool:
+            if project is not None:
+                return item.get("project") == project.name or item.get("project_id") == project.id
+            return item["category"] in work_cats
+
         return {
+            "project": {"name": project.name, "client": project.client, "description": project.description}
+            if project else None,
             "user_name": p.get("user_name") or "",
-            "employer_name": p.get("employer_name") or "",
+            "employer_name": (project.client if project else "") or p.get("employer_name") or "",
             "week_start": week_start.isoformat(),
             "week_end": week_end.isoformat(),
             "week_label": f"{timeutil.fa_date(week_start, with_weekday=False)} تا {timeutil.fa_date(week_end, with_weekday=False, with_year=True)}",
             "work_categories": sorted(work_cats),
             "stats": st,
-            "work_completed": [t for t in st["completed_tasks"] if t["category"] in work_cats],
-            "work_entries": [e for e in st["entries"] if e["category"] in work_cats],
-            "work_open": [t for t in open_items if t["category"] in work_cats],
+            "work_completed": [t for t in st["completed_tasks"] if is_work(t)],
+            "work_entries": [e for e in st["entries"] if is_work(e)],
+            "work_open": [t for t in open_items if is_work(t)],
+            "by_project": st.get("by_project", []),
             "open_items": open_items,
             "goals": goals,
             "weekly_score": score,
@@ -77,8 +89,13 @@ def collect(week_start: date, week_end: date) -> dict[str, Any]:
 
 def _fallback_work(data: dict[str, Any]) -> str:
     st = data["stats"]
-    work_min = sum(c["minutes"] for c in st["by_category"] if c["category"] in data["work_categories"])
-    lines = [f"## گزارش کار هفتگی\n**بازه:** {data['week_label']}", ""]
+    if data.get("project"):
+        work_min = sum(e["minutes"] for e in data["work_entries"])
+        title = f"## گزارش هفتگی پروژه {data['project']['name']}"
+    else:
+        work_min = sum(c["minutes"] for c in st["by_category"] if c["category"] in data["work_categories"])
+        title = "## گزارش کار هفتگی"
+    lines = [f"{title}\n**بازه:** {data['week_label']}", ""]
     if data["user_name"]:
         lines.insert(1, f"**نام:** {data['user_name']}")
     lines.append(f"**مجموع زمان کاری:** {timeutil.fa_duration(work_min)}\n")
@@ -129,7 +146,14 @@ personal, university or language-class items. Markdown, short sections:
 "## گزارش کار هفتگی" title line with the date range, then: خلاصه (2-3 sentences), کارهای انجام‌شده
 (bullets, with time spent when known), در حال انجام و برنامه هفته بعد, نکات/موانع (only if data suggests).
 Write in first person from the user's perspective, polite and factual. Do not invent work that is not in the data.
-If there is very little data, keep it short and honest. Use Persian digits for numbers."""
+If there is very little data, keep it short and honest. Use Persian digits for numbers.
+When the data has `by_project`, group the completed work by project."""
+
+PROJECT_PROMPT = """You write a concise, professional weekly progress report in Persian (Farsi) about ONE project,
+which the user will send to that project's client/employer. Use only data of this project. Markdown:
+"## گزارش هفتگی پروژه <name>" with the date range, then: خلاصه پیشرفت, کارهای انجام‌شده (with time spent when
+known), در حال انجام و قدم‌های بعدی (with deadlines), نکات/نیاز به هماهنگی (only if data suggests). First person,
+polite and factual; never invent work. Use Persian digits."""
 
 PERSONAL_PROMPT = """You are the user's personal assistant writing their weekly self-review in Persian (Farsi),
 warm but honest, like a good coach. Markdown with short sections: "## مرور هفته" with date range,
@@ -138,26 +162,33 @@ warm but honest, like a good coach. Markdown with short sections: "## مرور �
 concrete suggestions for next week based on upcoming deadlines. Do not invent data. Use Persian digits."""
 
 
-async def generate(offset: int = 0, ref: date | None = None) -> Report:
+async def generate(offset: int = 0, ref: date | None = None, project_id: int | None = None) -> Report:
     ws, we = week_bounds(offset, ref)
-    data = collect(ws, we)
+    data = collect(ws, we, project_id)
     llm = get_llm()
     payload = json.dumps(data, ensure_ascii=False, default=str)
-    model = get_settings().chat_model
+    model = llm.model("chat") if hasattr(llm, "model") else get_settings().chat_model
     try:
-        work = await llm.complete(
-            WORK_PROMPT.format(cats=", ".join(cal.CATEGORY_FA.get(c, c) for c in data["work_categories"])),
-            f"Employer name (may be empty): {data['employer_name']}\nData:\n{payload}",
-            model=model,
-        )
-        personal = await llm.complete(PERSONAL_PROMPT, f"Data:\n{payload}", model=model)
+        if data["project"]:
+            work = await llm.complete(PROJECT_PROMPT, f"Client: {data['employer_name']}\nData:\n{payload}",
+                                      model=model, purpose="report")
+            personal = ""
+        else:
+            work = await llm.complete(
+                WORK_PROMPT.format(cats=", ".join(cal.CATEGORY_FA.get(c, c) for c in data["work_categories"])),
+                f"Employer name (may be empty): {data['employer_name']}\nData:\n{payload}",
+                model=model, purpose="report",
+            )
+            personal = await llm.complete(PERSONAL_PROMPT, f"Data:\n{payload}", model=model, purpose="report")
     except LLMError as e:
         log.warning("report LLM failed, using fallback: %s", e)
-        work, personal = _fallback_work(data), _fallback_personal(data)
+        work = _fallback_work(data)
+        personal = "" if data["project"] else _fallback_personal(data)
     with session() as s:
-        rep = s.query(Report).filter(Report.week_start == ws).first()
+        rep = s.query(Report).filter(Report.week_start == ws, Report.project_id.is_(project_id) if project_id is None
+                                     else Report.project_id == project_id).first()
         if rep is None:
-            rep = Report(week_start=ws, week_end=we)
+            rep = Report(week_start=ws, week_end=we, project_id=project_id)
             s.add(rep)
         rep.work_report = work
         rep.personal_report = personal

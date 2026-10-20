@@ -98,6 +98,39 @@ class Event(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
 
+class Project(Base):
+    """Projects the user works on, with the nicknames they use for them ("پروژه ماشین")."""
+
+    __tablename__ = "projects"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(200))
+    aliases: Mapped[list[str]] = mapped_column(JSON, default=list)
+    category: Mapped[str] = mapped_column(String(32), default="work")
+    client: Mapped[str] = mapped_column(String(200), default="")  # کارفرما / who the work is delivered to
+    description: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(16), default="active")  # active | paused | done
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class Contact(Base):
+    """People the user is reaching out to — mainly professors / potential supervisors for applying."""
+
+    __tablename__ = "contacts"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(200))
+    kind: Mapped[str] = mapped_column(String(16), default="professor")
+    organization: Mapped[str] = mapped_column(String(200), default="")  # university / company
+    field: Mapped[str] = mapped_column(Text, default="")  # research area
+    email: Mapped[str] = mapped_column(String(200), default="")
+    url: Mapped[str] = mapped_column(Text, default="")
+    # to_contact | contacted | replied | interview | positive | rejected | no_reply
+    status: Mapped[str] = mapped_column(String(16), default="to_contact", index=True)
+    last_contact_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    next_followup_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    notes: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
 class Task(Base):
     __tablename__ = "tasks"
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -115,6 +148,7 @@ class Task(Base):
     )
     goal_id: Mapped[int | None] = mapped_column(ForeignKey("goals.id", ondelete="SET NULL"), nullable=True)
     parent_id: Mapped[int | None] = mapped_column(ForeignKey("tasks.id", ondelete="CASCADE"), nullable=True, index=True)
+    project_id: Mapped[int | None] = mapped_column(ForeignKey("projects.id", ondelete="SET NULL"), nullable=True, index=True)
     energy: Mapped[str] = mapped_column(String(8), default="normal")  # high (deep work) | normal | low
     source: Mapped[str] = mapped_column(String(32), default="chat")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
@@ -141,6 +175,7 @@ class WorkLog(Base):
     __tablename__ = "work_logs"
     id: Mapped[int] = mapped_column(primary_key=True)
     task_id: Mapped[int | None] = mapped_column(ForeignKey("tasks.id", ondelete="SET NULL"), nullable=True, index=True)
+    project_id: Mapped[int | None] = mapped_column(ForeignKey("projects.id", ondelete="SET NULL"), nullable=True)
     description: Mapped[str] = mapped_column(Text, default="")
     category: Mapped[str] = mapped_column(String(32), default="personal")
     start_at: Mapped[datetime] = mapped_column(DateTime, index=True)
@@ -167,6 +202,7 @@ class Followup(Base):
         ForeignKey("recurring_events.id", ondelete="CASCADE"), nullable=True
     )
     block_id: Mapped[int | None] = mapped_column(ForeignKey("planned_blocks.id", ondelete="CASCADE"), nullable=True)
+    contact_id: Mapped[int | None] = mapped_column(ForeignKey("contacts.id", ondelete="CASCADE"), nullable=True)
     created_by: Mapped[str] = mapped_column(String(16), default="system")  # system|agent|snooze
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     sent_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
@@ -190,6 +226,7 @@ class Report(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     week_start: Mapped[date] = mapped_column(Date, index=True)
     week_end: Mapped[date] = mapped_column(Date)
+    project_id: Mapped[int | None] = mapped_column(Integer, nullable=True)  # a report for one project's client
     work_report: Mapped[str] = mapped_column(Text, default="")
     personal_report: Mapped[str] = mapped_column(Text, default="")
     stats: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)

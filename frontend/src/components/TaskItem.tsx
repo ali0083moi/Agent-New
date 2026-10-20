@@ -4,6 +4,7 @@ import { api, type Task } from "../api";
 import { useLive } from "../live";
 import { CATEGORY, cx, duration, fa, faDateTime, relative } from "../util";
 import { JalaliInput } from "./JalaliPicker";
+import { useProjects } from "./Projects";
 import { Button, CategoryBadge, Field, IconButton, Input, Modal, ProgressBar, Segmented, Select } from "./ui";
 
 const PRIORITY = [
@@ -71,6 +72,9 @@ export function TaskItem({ task, compact, nested }: { task: Task; compact?: bool
             </span>
           )}
           {!compact && !nested && <CategoryBadge category={task.category} />}
+          {task.project && !nested && (
+            <span className="inline-flex items-center rounded-lg bg-slate-100 px-2 py-0.5 text-xs text-slate-600 dark:bg-slate-800 dark:text-slate-300">📁 {task.project}</span>
+          )}
           {task.subtasks_total ? (
             <span className="inline-flex items-center gap-1 rounded-lg bg-brand-50 px-1.5 py-0.5 text-[11px] text-brand-700 dark:bg-brand-500/15 dark:text-brand-200">
               <Layers className="size-3" /> {fa(task.subtasks_done ?? 0)}/{fa(task.subtasks_total)}
@@ -129,6 +133,8 @@ export function TaskEditor({ task, onClose }: { task?: Task; onClose: () => void
   const [priority, setPriority] = useState(String(task?.priority ?? 2));
   const [due, setDue] = useState<string | null>(task?.due ?? null);
   const [energy, setEnergy] = useState<"high" | "normal" | "low">(task?.energy ?? "normal");
+  const [projectId, setProjectId] = useState<string>(task?.project_id ? String(task.project_id) : "");
+  const projects = useProjects();
   const [estimate, setEstimate] = useState(task?.estimated_minutes ? String(task.estimated_minutes) : "");
   const [progress, setProgress] = useState(task?.progress ?? 0);
   const [busy, setBusy] = useState(false);
@@ -144,6 +150,8 @@ export function TaskEditor({ task, onClose }: { task?: Task; onClose: () => void
       energy,
       estimated_minutes: estimate ? Number(estimate) : undefined,
     };
+    if (projectId) body.project = projectId;
+    else if (task?.project_id) body.project = "none";
     try {
       if (task) {
         body.due = due ?? "none";
@@ -219,6 +227,13 @@ export function TaskEditor({ task, onClose }: { task?: Task; onClose: () => void
             <Input type="number" min={5} step={5} value={estimate} onChange={(e) => setEstimate(e.target.value)} placeholder="۶۰" />
           </Field>
         </div>
+        <Field label="پروژه">
+          <Select
+            value={projectId}
+            onChange={setProjectId}
+            options={[{ value: "", label: "بدون پروژه" }, ...(projects.data?.projects ?? []).map((p) => ({ value: String(p.id), label: p.name }))]}
+          />
+        </Field>
         <Field label="نوع کار" hint="کارهای عمیق در ساعت‌های اوج تمرکزت چیده می‌شوند">
           <Segmented
             value={energy}

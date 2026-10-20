@@ -456,3 +456,147 @@ def get_insights(s: Session, ctx: Ctx):
         "reminders_text": insights.reminder_lines(rs),
         "gamification": gamify.summary(s),
     }
+
+
+# ------------------------------------------------------------------ projects
+from .. import projects as projects_mod  # noqa: E402
+from ..db import Contact, Project  # noqa: E402
+
+
+@tool(
+    "add_project",
+    "Register a project the user works on, with ALL the nicknames they use for it (e.g. name 'tahami supercars', "
+    "aliases ['پروژه ماشین', 'ماشین', 'tahami']). Then link tasks/time with project='<name or nickname>'.",
+    {
+        "name": {"type": "string"},
+        "aliases": {"type": "array", "items": {"type": "string"}},
+        "category": {"type": "string", "enum": CATEGORIES, "description": "work for company/freelance projects"},
+        "client": {"type": "string", "description": "who the work is delivered to (کارفرما), if known"},
+        "description": {"type": "string"},
+    },
+    ["name"],
+    changes=("projects", "tasks"),
+)
+def add_project(s: Session, ctx: Ctx, name: str, aliases: list[str] | None = None, category: str = "work",
+                client: str = "", description: str = ""):
+    existing = projects_mod.resolve(s, name)
+    if existing is not None and projects_mod.norm(existing.name) == projects_mod.norm(name):
+        journal.before_update(s, ctx, existing)
+        existing.aliases = sorted({*(existing.aliases or []), *(aliases or [])})
+        if client:
+            existing.client = client
+        if description:
+            existing.description = description
+        s.flush()
+        return {"project": projects_mod.project_dict(s, existing), "note": "already existed; nicknames merged"}
+    p = Project(name=name.strip(), aliases=[a.strip() for a in aliases or [] if a.strip()], category=_cat(category, "work"),
+                client=client, description=description)
+    s.add(p)
+    s.flush()
+    journal.created(s, ctx, p, f"پروژه «{p.name}»")
+    return {"project": projects_mod.project_dict(s, p)}
+
+
+@tool(
+    "update_project",
+    "Change a project (find it by name, nickname or id): rename, add nicknames, client, status active|paused|done.",
+    {
+        "project": {"type": "string", "description": "name / nickname / id"},
+        "name": {"type": "string"},
+        "add_aliases": {"type": "array", "items": {"type": "string"}},
+        "category": {"type": "string", "enum": CATEGORIES},
+        "client": {"type": "string"},
+        "description": {"type": "string"},
+        "status": {"type": "string", "enum": ["active", "paused", "done"]},
+    },
+    ["project"],
+    changes=("projects", "tasks"),
+)
+def update_project(s: Session, ctx: Ctx, project: str, **data):
+    p = projects_mod.resolve(s, project)
+    if p is None:
+        return {"error": f"project '{project}' not found", "known": [x.name for x in s.query(Project).all()]}
+    journal.before_update(s, ctx, p, f"پروژه «{p.name}»")
+    for key in ("name", "client", "description", "status"):
+        if key in data:
+            setattr(p, key, data[key])
+    if "category" in data:
+        p.category = _cat(data["category"], p.category)
+    if data.get("add_aliases"):
+        p.aliases = sorted({*(p.aliases or []), *(a.strip() for a in data["add_aliases"] if a.strip())})
+    s.flush()
+    return {"project": projects_mod.project_dict(s, p)}
+
+
+@tool("list_projects", "Projects with nicknames, open tasks, time spent this week and next deadline.", {})
+def list_projects(s: Session, ctx: Ctx):
+    return {"projects": [projects_mod.project_dict(s, p) for p in s.query(Project).order_by(Project.id).all()]}
+
+
+# ------------------------------------------------------------------ supervisor search / contacts
+_CONTACT_PROPS = {
+    "name": {"type": "string", "description": "e.g. 'Prof. Jane Smith'"},
+    "organization": {"type": "string", "description": "university / lab / company"},
+    "field": {"type": "string", "description": "research area / why they fit"},
+    "email": {"type": "string"},
+    "url": {"type": "string"},
+    "status": {"type": "string", "enum": projects_mod.CONTACT_STATUS},
+    "next_followup": {"type": "string", "description": DT_HELP},
+    "notes": {"type": "string"},
+}
+
+
+@tool(
+    "add_contact",
+    "Track a professor / potential supervisor (or other person) in the application pipeline. Status: to_contact, "
+    "contacted (email sent → a follow-up is scheduled automatically), replied, interview, positive, rejected, no_reply.",
+    _CONTACT_PROPS,
+    ["name"],
+    changes=("contacts", "followups"),
+)
+def add_contact(s: Session, ctx: Ctx, name: str, status: str = "to_contact", next_followup: str | None = None, **data):
+    c = Contact(name=name.strip(), **{k: v for k, v in data.items() if k in ("organization", "field", "email", "url", "notes")})
+    projects_mod.apply_status(c, status)
+    if next_followup:
+        c.next_followup_at = timeutil.parse_datetime(next_followup, default_time=timeutil.parse_time("10:00"))
+    s.add(c)
+    s.flush()
+    journal.created(s, ctx, c, f"استاد «{c.name}»")
+    return {"contact": projects_mod.contact_dict(c)}
+
+
+@tool(
+    "update_contact",
+    "Update a contact found by name or id: new status (e.g. 'contacted' after sending the email, 'replied'), "
+    "add a note, set the next follow-up date.",
+    {"contact": {"type": "string", "description": "name or id"}, **_CONTACT_PROPS, "add_note": {"type": "string"},
+     "contacted_at": {"type": "string", "description": "when the email was sent, if not now"}},
+    ["contact"],
+    changes=("contacts", "followups"),
+)
+def update_contact(s: Session, ctx: Ctx, contact: str, **data):
+    c = projects_mod.resolve_contact(s, contact)
+    if c is None:
+        return {"error": f"contact '{contact}' not found", "known": [x.name for x in s.query(Contact).all()]}
+    journal.before_update(s, ctx, c, f"استاد «{c.name}»")
+    for key in ("name", "organization", "field", "email", "url", "notes"):
+        if key in data:
+            setattr(c, key, data[key])
+    if data.get("status"):
+        when = timeutil.parse_datetime(data["contacted_at"]) if data.get("contacted_at") else None
+        projects_mod.apply_status(c, data["status"], when)
+    if data.get("next_followup"):
+        c.next_followup_at = timeutil.parse_datetime(data["next_followup"], default_time=timeutil.parse_time("10:00"))
+    if data.get("add_note"):
+        c.notes = (c.notes + "\n" if c.notes else "") + f"[{timeutil.jalali_str(timeutil.now())}] {data['add_note']}"
+    s.flush()
+    return {"contact": projects_mod.contact_dict(c)}
+
+
+@tool("list_contacts", "The supervisor-search pipeline (all contacts with status, last contact, next follow-up).",
+      {"status": {"type": "string", "enum": projects_mod.CONTACT_STATUS}})
+def list_contacts(s: Session, ctx: Ctx, status: str | None = None):
+    data = projects_mod.pipeline(s)
+    if status:
+        data["contacts"] = [c for c in data["contacts"] if c["status"] == status]
+    return data

@@ -143,6 +143,7 @@ function Shell({ me, page, go }: { me: Me; page: string; go: (p: string) => void
           </div>
           {me.telegram?.owner_bound ? "✅ متصل؛ پیگیری‌ها در تلگرام هم می‌آیند." : me.telegram?.configured ? "در انتظار اتصال — از تنظیمات کد بگیر." : "تنظیم نشده"}
         </div>
+        {me.version && <div className="mt-2 px-2 text-[10px] text-slate-400 ltr">v {me.version}</div>}
       </aside>
 
       {/* main */}

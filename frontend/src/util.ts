@@ -144,6 +144,8 @@ export const FOLLOWUP_KIND: Record<string, string> = {
   weekly_planning: "برنامه‌ریزی هفتگی",
   habit_reminder: "یادآوری عادت",
   vocab_review: "مرور لغت",
+  contact_followup: "پیگیری استاد",
+  deploy: "به‌روزرسانی",
 };
 
 export const WEEKDAYS: { key: string; label: string; short: string }[] = [

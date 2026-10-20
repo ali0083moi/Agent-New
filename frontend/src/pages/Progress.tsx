@@ -4,6 +4,7 @@ import { api, type Commitment, type Habit, type Ielts, type Insights, type Vocab
 import { useData, useLive } from "../live";
 import { Heatmap, HourBars, IeltsChart, SKILL_FA } from "../components/charts";
 import { JalaliInput } from "../components/JalaliPicker";
+import { ContactsCard } from "../components/Contacts";
 import { Badge, Button, Card, Empty, Field, Input, Modal, ProgressBar, Ring, Segmented, Select, Spinner } from "../components/ui";
 import { cx, fa, faDate, isoDate, serverNow, shortDuration } from "../util";
 
@@ -377,7 +378,10 @@ export default function Progress() {
         <Commitments />
       </div>
 
-      <IeltsCard />
+      <div className="grid gap-5 lg:grid-cols-2">
+        <ContactsCard />
+        <IeltsCard />
+      </div>
 
       {ins.data && (
         <div className="grid gap-5 lg:grid-cols-2">

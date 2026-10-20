@@ -26,6 +26,7 @@ async def scheduler_loop() -> None:
 
     interval = get_settings().scheduler_interval_seconds
     await asyncio.sleep(3)
+    await announce_new_version()
     n = 0
     while True:
         try:
@@ -39,6 +40,23 @@ async def scheduler_loop() -> None:
             log.exception("scheduler tick failed")
         n += 1
         await asyncio.sleep(interval)
+
+
+async def announce_new_version() -> None:
+    """After an automatic deploy, tell the owner (web + Telegram) once which version is now running."""
+    from . import notify, prefs
+    from .config import version
+
+    v = version()
+    if not v.get("sha"):
+        return
+    seen = prefs.get("deployed_version")
+    prefs.set("deployed_version", v["sha"])
+    if seen and seen != v["sha"]:
+        try:
+            await notify.deliver(f"🚀 نسخه جدید نصب شد: **{v.get('subject', '')}** (`{v.get('short', '')}`)", "deploy")
+        except Exception:  # noqa: BLE001
+            log.exception("could not announce the new version")
 
 
 @asynccontextmanager

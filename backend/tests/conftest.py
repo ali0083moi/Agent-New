@@ -65,7 +65,7 @@ class FakeLLM:
         return {"spent_today": 0.0, "limit": 0, "over": False}
 
     async def chat(self, messages, tools=None, model=None, purpose="chat", on_delta=None):
-        self.calls.append({"messages": messages, "tools": tools, "model": model, "purpose": purpose})
+        self.calls.append({"messages": list(messages), "tools": tools, "model": model, "purpose": purpose})
         if self.script:
             step = self.script.pop(0)
             res = step(messages, tools) if callable(step) else step

@@ -3,6 +3,7 @@ import { ListTodo, Plus } from "lucide-react";
 import type { Task } from "../api";
 import { useData } from "../live";
 import { TaskEditor, TaskItem } from "../components/TaskItem";
+import { ProjectStrip } from "../components/Projects";
 import { Button, Card, Empty, Segmented, Spinner } from "../components/ui";
 import { CATEGORY, cx, fa, parseLocal, serverNow } from "../util";
 
@@ -39,8 +40,9 @@ function groupTasks(all: Task[]): Group[] {
 export default function Tasks() {
   const [status, setStatus] = useState<"open" | "done" | "all">("open");
   const [category, setCategory] = useState<string>("");
+  const [projectId, setProjectId] = useState<number | null>(null);
   const [creating, setCreating] = useState(false);
-  const { data, loading } = useData<{ tasks: Task[] }>(`/api/tasks?status=${status}${category ? `&category=${category}` : ""}`, ["tasks", "stats"]);
+  const { data, loading } = useData<{ tasks: Task[] }>(`/api/tasks?status=${status}${category ? `&category=${category}` : ""}${projectId ? `&project_id=${projectId}` : ""}`, ["tasks", "stats"]);
   const groups = useMemo(() => groupTasks(data?.tasks ?? []), [data]);
 
   return (
@@ -54,6 +56,8 @@ export default function Tasks() {
           <Plus className="size-4" /> تسک جدید
         </Button>
       </div>
+
+      <ProjectStrip selected={projectId} onSelect={setProjectId} />
 
       <div className="flex flex-wrap items-center gap-3">
         <Segmented value={status} onChange={setStatus} options={[{ value: "open", label: "باز" }, { value: "done", label: "انجام‌شده" }, { value: "all", label: "همه" }]} />

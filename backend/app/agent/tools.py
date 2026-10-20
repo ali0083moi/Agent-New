@@ -5,14 +5,17 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Callable
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from .. import cal, followups, journal, planner, prefs, serialize, stats, timeutil
-from ..db import Event, Followup, Goal, Memory, PlannedBlock, RecurringEvent, Task, WorkLog, session
+from .. import cal, followups, journal, planner, prefs, projects, serialize, stats, timeutil
+from ..db import (Commitment, Contact, Event, Followup, Goal, Habit, Memory, PlannedBlock, Project, RecurringEvent,
+                  Task, VocabWord, WorkLog, session)
 
 log = logging.getLogger(__name__)
 
@@ -72,6 +75,94 @@ def schemas() -> list[dict[str, Any]]:
     return [t.schema() for t in REGISTRY.values()]
 
 
+# id-like arguments -> the table they must exist in
+REF_MODELS = {
+    "goal_id": Goal, "parent_id": Task, "task_id": Task, "recurring_event_id": RecurringEvent,
+    "due_next_session_of": RecurringEvent, "event_id": Event, "block_id": PlannedBlock, "habit_id": Habit,
+    "commitment_id": Commitment, "memory_id": Memory, "followup_id": Followup, "word_id": VocabWord,
+    "project_id": Project, "contact_id": Contact,
+}
+PRIORITY_WORDS = {
+    "1": 1, "high": 1, "urgent": 1, "critical": 1, "بالا": 1, "مهم": 1, "زیاد": 1, "فوری": 1,
+    "2": 2, "normal": 2, "medium": 2, "mid": 2, "معمولی": 2, "متوسط": 2,
+    "3": 3, "low": 3, "کم": 3, "پایین": 3,
+}
+
+
+def _num(value: Any, integer: bool) -> Any:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return int(round(value)) if integer else value
+    m = re.search(r"-?\d+(?:\.\d+)?", timeutil.to_latin_digits(str(value)).replace("٫", "."))
+    if not m:
+        raise ValueError
+    n = float(m.group(0))
+    return int(round(n)) if integer else n
+
+
+def coerce_args(spec: "ToolSpec", args: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """Make model-produced arguments safe: fix types, drop unknown keys, map priority words."""
+    props = spec.parameters.get("properties", {})
+    out: dict[str, Any] = {}
+    notes: list[str] = []
+    accepts_any = any(p.kind == p.VAR_KEYWORD for p in inspect.signature(spec.fn).parameters.values())
+    for key, value in args.items():
+        if value is None:
+            continue
+        ps = props.get(key)
+        if ps is None:
+            if not accepts_any:
+                notes.append(f"ignored unknown argument '{key}'")
+                continue
+            out[key] = value
+            continue
+        t = ps.get("type")
+        try:
+            if key == "priority" and not isinstance(value, int):
+                value = PRIORITY_WORDS.get(timeutil.to_latin_digits(str(value)).strip().lower(), 2)
+            elif t in ("integer", "number"):
+                value = _num(value, t == "integer")
+            elif t == "boolean" and isinstance(value, str):
+                value = value.strip().lower() in ("true", "1", "yes", "y", "بله", "آره", "اره")
+            elif t == "array" and isinstance(value, str):
+                try:
+                    value = json.loads(value)
+                except json.JSONDecodeError:
+                    value = [v.strip() for v in re.split(r"[,،]", value) if v.strip()]
+            elif t == "object" and isinstance(value, str):
+                value = json.loads(value)
+            elif t == "string" and not isinstance(value, str):
+                value = str(value)
+        except (ValueError, json.JSONDecodeError):
+            notes.append(f"ignored invalid value for '{key}': {value!r}")
+            continue
+        enum = ps.get("enum")
+        if enum and value not in enum:
+            lowered = str(value).strip().lower()
+            match = next((e for e in enum if str(e).lower() == lowered), None)
+            if match is None:
+                notes.append(f"ignored '{key}'={value!r} (allowed: {enum})")
+                continue
+            value = match
+        out[key] = value
+    return out, notes
+
+
+def _check_refs(s: Session, spec: "ToolSpec", args: dict[str, Any]) -> list[str]:
+    """Optional links that point to nothing are dropped (instead of crashing the whole save)."""
+    required = set(spec.parameters.get("required", []))
+    notes = []
+    for key in list(args):
+        model = REF_MODELS.get(key)
+        if model is None or key in required or not isinstance(args[key], int):
+            continue
+        if s.get(model, args[key]) is None:
+            notes.append(f"{key}={args[key]} does not exist — saved without it (use names from the context, never guess ids)")
+            args.pop(key)
+    return notes
+
+
 async def execute(name: str, raw_args: str | dict[str, Any], ctx: Ctx) -> dict[str, Any]:
     spec = REGISTRY.get(name)
     if spec is None:
@@ -82,25 +173,36 @@ async def execute(name: str, raw_args: str | dict[str, Any], ctx: Ctx) -> dict[s
             raise ValueError("arguments must be an object")
     except Exception as e:  # noqa: BLE001
         return {"error": f"invalid JSON arguments: {e}"}
-    args = {k: v for k, v in args.items() if v is not None}
+    args, notes = coerce_args(spec, args)
+    missing = [k for k in spec.parameters.get("required", []) if k not in args]
+    if missing:
+        return {"error": f"missing required argument(s): {', '.join(missing)}", "notes": notes}
     try:
         if inspect.iscoroutinefunction(spec.fn):
             result = await spec.fn(ctx=ctx, **args)
         else:
             with session() as s:
+                notes += _check_refs(s, spec, args)
                 result = spec.fn(s, ctx=ctx, **args)
         if isinstance(result, dict) and result.get("needs_confirmation"):
             return result
         ctx.changed.update(spec.changes)
         if "tasks" in spec.changes and name not in NO_REPLAN:
             ctx.replan = True
-        return result if isinstance(result, dict) else {"result": result}
+        result = result if isinstance(result, dict) else {"result": result}
+        if notes:
+            result.setdefault("warnings", []).extend(notes)
+        return result
+    except IntegrityError as e:
+        log.warning("tool %s integrity error: %s", name, e)
+        return {"error": "a referenced item does not exist (bad id). Retry without that id, or refer to projects by name.",
+                "notes": notes}
     except TypeError as e:
         log.warning("tool %s bad args: %s", name, e)
-        return {"error": f"bad arguments: {e}"}
+        return {"error": f"bad arguments: {e}", "notes": notes}
     except Exception as e:  # noqa: BLE001
         log.exception("tool %s failed", name)
-        return {"error": str(e)}
+        return {"error": str(e), "notes": notes}
 
 
 def finalize(ctx: Ctx) -> None:
@@ -121,8 +223,19 @@ def finalize(ctx: Ctx) -> None:
 def _get(s: Session, model, obj_id: int, label: str):
     obj = s.get(model, int(obj_id))
     if obj is None:
-        raise ValueError(f"{label} با شناسه {obj_id} پیدا نشد")
+        raise ValueError(f"{label} با شناسه {obj_id} پیدا نشد — only use ids shown in the context or returned by tools")
     return obj
+
+
+def _project(s: Session, ref: Any, warnings: list[str]) -> Project | None:
+    if ref is None or str(ref).strip() == "":
+        return None
+    p = projects.resolve(s, ref)
+    if p is None:
+        known = [x.name for x in s.query(Project).all()]
+        warnings.append(f"project '{ref}' not found (known: {known}). Saved without a project — create it with "
+                        "add_project (with its nicknames) and then link the task with update_task(project=...).")
+    return p
 
 
 def _cat(value: str | None, default: str = "personal") -> str:
@@ -209,6 +322,7 @@ def list_tasks(s: Session, ctx: Ctx, status: str = "open", category: str | None 
         "energy": {"type": "string", "enum": ["high", "normal", "low"],
                    "description": "high = deep/hard work (essays, projects, studying), low = easy admin/errands"},
         "parent_id": {"type": "integer", "description": "Parent task (makes this a subtask / milestone)."},
+        "project": {"type": "string", "description": "Project name or nickname (e.g. 'پروژه ماشین'). Resolved by name."},
     },
     ["title"],
     changes=("tasks", "followups"),
@@ -227,9 +341,16 @@ def add_task(
     goal_id: int | None = None,
     energy: str = "normal",
     parent_id: int | None = None,
+    project: str | None = None,
 ):
     due_at = timeutil.parse_datetime(due) if due else None
+    warnings: list[str] = []
+    proj = _project(s, project, warnings)
     parent = _get(s, Task, parent_id, "تسک والد") if parent_id else None
+    if parent is not None and proj is None and parent.project_id:
+        proj = s.get(Project, parent.project_id)
+    if proj is not None and not category:
+        category = proj.category
     if parent is not None:
         category = category or parent.category
         recurring_event_id = recurring_event_id or parent.recurring_event_id
@@ -258,6 +379,7 @@ def add_task(
         goal_id=goal_id,
         energy=energy if energy in ("high", "normal", "low") else "normal",
         parent_id=parent.id if parent else None,
+        project_id=proj.id if proj else None,
         source=ctx.channel,
     )
     s.add(t)
@@ -265,10 +387,13 @@ def add_task(
     journal.created(s, ctx, t, f"تسک «{t.title}»")
     planner.invalidate(s)
     planned = followups.ensure_task_followups(s, t, prefs.all_prefs(s), timeutil.now())
-    return {
+    out = {
         "task": serialize.task(s, t),
         "reminders_scheduled": [timeutil.iso(f.due_at) for f in planned if f.kind != "overdue"],
     }
+    if warnings:
+        out["warnings"] = warnings
+    return out
 
 
 @tool(
@@ -286,6 +411,7 @@ def add_task(
         "progress": {"type": "integer", "description": "percent 0-100"},
         "add_note": {"type": "string"},
         "energy": {"type": "string", "enum": ["high", "normal", "low"]},
+        "project": {"type": "string", "description": "Project name/nickname, or 'none' to unlink."},
     },
     ["task_id"],
     changes=("tasks", "followups", "schedule"),
@@ -293,6 +419,14 @@ def add_task(
 def update_task(s: Session, ctx: Ctx, task_id: int, **fields):
     t = _get(s, Task, task_id, "تسک")
     journal.before_update(s, ctx, t, f"ویرایش «{t.title}»")
+    warnings: list[str] = []
+    if "project" in fields:
+        if str(fields["project"]).strip().lower() in ("none", "null", ""):
+            t.project_id = None
+        else:
+            proj = _project(s, fields["project"], warnings)
+            if proj is not None:
+                t.project_id = proj.id
     for key in ("title", "description", "estimated_minutes", "priority", "energy"):
         if key in fields:
             setattr(t, key, fields[key])
@@ -310,7 +444,10 @@ def update_task(s: Session, ctx: Ctx, task_id: int, **fields):
     s.flush()
     if t.status in ("todo", "doing"):
         followups.ensure_task_followups(s, t, prefs.all_prefs(s), timeutil.now())
-    return {"task": serialize.task(s, t)}
+    out: dict[str, Any] = {"task": serialize.task(s, t)}
+    if warnings:
+        out["warnings"] = warnings
+    return out
 
 
 def _set_status(s: Session, t: Task, status: str, ctx: Ctx | None = None) -> None:
@@ -628,6 +765,7 @@ def plan_schedule(s: Session, ctx: Ctx, days: int = 7):
         "block_id": {"type": "integer", "description": "Planned block this work belongs to (marks it)."},
         "block_status": {"type": "string", "enum": ["done", "partial", "skipped"]},
         "progress": {"type": "integer", "description": "New task progress percent (optional)."},
+        "project": {"type": "string", "description": "Project name/nickname (when there is no task)."},
     },
     ["description"],
     changes=("stats", "tasks", "schedule"),
@@ -635,8 +773,9 @@ def plan_schedule(s: Session, ctx: Ctx, days: int = 7):
 def log_work(s: Session, ctx: Ctx, description: str, minutes: int | None = None, start: str | None = None,
              end: str | None = None, task_id: int | None = None, category: str | None = None,
              productive: bool = True, block_id: int | None = None, block_status: str | None = None,
-             progress: int | None = None):
+             progress: int | None = None, project: str | None = None):
     t = _get(s, Task, task_id, "تسک") if task_id else None
+    proj = _project(s, project, []) if project else (s.get(Project, t.project_id) if t and t.project_id else None)
     if start:
         st = timeutil.parse_datetime(start)
         en = _parse_end(st, end, minutes)
@@ -649,7 +788,8 @@ def log_work(s: Session, ctx: Ctx, description: str, minutes: int | None = None,
     lg = None
     if mins > 0:
         lg = WorkLog(task_id=t.id if t else None, description=description,
-                     category=_cat(category, t.category if t else "personal"),
+                     category=_cat(category, t.category if t else (proj.category if proj else "personal")),
+                     project_id=proj.id if proj else None,
                      start_at=st, end_at=en, minutes=mins, productive=bool(productive), source="chat")
         s.add(lg)
         journal.created(s, ctx, lg, f"ثبت {timeutil.fa_duration(mins)}")
@@ -673,10 +813,11 @@ def log_work(s: Session, ctx: Ctx, description: str, minutes: int | None = None,
     "start_focus",
     "Start a focus/work timer (the user says they are starting to work on something).",
     {"task_id": {"type": "integer"}, "description": {"type": "string"},
-     "category": {"type": "string", "enum": CATEGORIES}},
+     "category": {"type": "string", "enum": CATEGORIES}, "project": {"type": "string"}},
     changes=("stats", "tasks"),
 )
-def start_focus(s: Session, ctx: Ctx, task_id: int | None = None, description: str = "", category: str | None = None):
+def start_focus(s: Session, ctx: Ctx, task_id: int | None = None, description: str = "", category: str | None = None,
+                project: str | None = None):
     closed = None
     cur = stats.active_focus(s)
     if cur is not None:
@@ -686,9 +827,10 @@ def start_focus(s: Session, ctx: Ctx, task_id: int | None = None, description: s
     if t and t.status == "todo":
         journal.before_update(s, ctx, t)
         t.status = "doing"
+    proj = _project(s, project, []) if project else (s.get(Project, t.project_id) if t and t.project_id else None)
     lg = WorkLog(task_id=t.id if t else None, description=description or (t.title if t else "کار"),
-                 category=_cat(category, t.category if t else "personal"), start_at=timeutil.now(),
-                 end_at=None, source="focus")
+                 category=_cat(category, t.category if t else (proj.category if proj else "personal")),
+                 project_id=proj.id if proj else None, start_at=timeutil.now(), end_at=None, source="focus")
     s.add(lg)
     s.flush()
     journal.created(s, ctx, lg, "تایمر تمرکز")
@@ -868,14 +1010,22 @@ def update_goal(s: Session, ctx: Ctx, goal_id: int, **data):
 @tool(
     "weekly_report",
     "Generate the weekly report (a work report for the employer + a personal review). "
-    "week_offset 0 = current week (Sat-Fri), -1 = last week.",
-    {"week_offset": {"type": "integer"}},
+    "week_offset 0 = current week (Sat-Fri), -1 = last week. Give `project` for a report about one project only "
+    "(e.g. for that project's client).",
+    {"week_offset": {"type": "integer"}, "project": {"type": "string", "description": "project name/nickname"}},
     changes=("reports",),
 )
-async def weekly_report(ctx: Ctx, week_offset: int = 0):
+async def weekly_report(ctx: Ctx, week_offset: int = 0, project: str | None = None):
     from .. import reports
 
-    rep = await reports.generate(int(week_offset))
+    project_id = None
+    if project:
+        with session() as s:
+            p = projects.resolve(s, project)
+            if p is None:
+                return {"error": f"project '{project}' not found"}
+            project_id = p.id
+    rep = await reports.generate(int(week_offset), project_id=project_id)
     return {"report_id": rep.id, "work_report": rep.work_report, "personal_report": rep.personal_report,
             "note": "The report is saved and visible on the Reports page. Show both parts to the user."}
 
@@ -890,7 +1040,8 @@ async def weekly_report(ctx: Ctx, week_offset: int = 0):
     "semester_start (YYYY-MM-DD), employer_name, work_report_categories (list), mirror_web_to_telegram, "
     "voice_replies (off|when_voice|always), auto_replan, rescue_mode, weekly_planning_day, weekly_planning_time, "
     "ielts_target_band, ielts_exam_date, vocab_review_time, vocab_daily_count, daily_budget_usd, "
-    "adaptive_reminders, semantic_memory, auto_facts, llm_chat_model / llm_fast_model / llm_vision_model / "
+    "adaptive_reminders, semantic_memory, auto_facts, professor_followup_days, "
+    "llm_chat_model / llm_fast_model / llm_vision_model / "
     "llm_ielts_model (override AI models; '' = default). "
     "Special key current_week_parity ('odd'|'even') tells which university week (فرد/زوج) the current week is.",
     {"changes": {"type": "object", "description": "key -> new value"}},

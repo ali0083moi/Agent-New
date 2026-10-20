@@ -62,3 +62,14 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
+
+
+def version() -> dict:
+    """Release info written by CI (VERSION.json at the repo/release root); empty in development."""
+    import json
+
+    f = ROOT_DIR / "VERSION.json"
+    try:
+        return json.loads(f.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}

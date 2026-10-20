@@ -50,7 +50,10 @@ def logout(response: Response):
 @public.get("/me")
 def me(request: Request):
     ok = auth.is_authenticated(request)
-    out: dict[str, Any] = {"auth_required": auth.auth_required(), "authenticated": ok, "now": timeutil.iso(timeutil.now())}
+    from ..config import version
+
+    out: dict[str, Any] = {"auth_required": auth.auth_required(), "authenticated": ok, "now": timeutil.iso(timeutil.now()),
+                           "version": version().get("short")}
     if ok:
         p = prefs.all_prefs()
         out.update(
@@ -212,9 +215,11 @@ def agenda(start: str | None = None, days: int = 7):
 
 # ---------------------------------------------------------------- tasks
 @router.get("/tasks")
-def list_tasks(status: str = "open", category: str | None = None):
+def list_tasks(status: str = "open", category: str | None = None, project_id: int | None = None):
     with session() as s:
         q = s.query(Task)
+        if project_id:
+            q = q.filter(Task.project_id == project_id)
         if status == "open":
             q = q.filter(Task.status.in_(["todo", "doing"]))
         elif status == "done":
@@ -431,6 +436,77 @@ def usage(days: int = 30):
         }
 
 
+# ---------------------------------------------------------------- projects & supervisor contacts
+@router.get("/projects")
+def list_projects():
+    from .. import projects as pm
+    from ..db import Project
+
+    with session() as s:
+        return {"projects": [pm.project_dict(s, p) for p in s.query(Project).order_by(Project.id).all()]}
+
+
+@router.post("/projects")
+async def create_project(body: dict[str, Any]):
+    return await _tool("add_project", body)
+
+
+@router.patch("/projects/{project_id}")
+async def patch_project(project_id: int, body: dict[str, Any]):
+    from ..db import Project
+
+    aliases = body.pop("aliases", None)
+    res = await _tool("update_project", {**body, "project": str(project_id)})
+    if aliases is not None:
+        with session() as s:
+            p = s.get(Project, project_id)
+            p.aliases = [a.strip() for a in aliases if str(a).strip()]
+        bus.publish("data_changed", ["projects"])
+    return res
+
+
+@router.delete("/projects/{project_id}")
+def remove_project(project_id: int):
+    from ..db import Project
+
+    with session() as s:
+        p = s.get(Project, project_id)
+        if p:
+            s.delete(p)
+    bus.publish("data_changed", ["projects", "tasks"])
+    return {"deleted": project_id}
+
+
+@router.get("/contacts")
+def list_contacts():
+    from .. import projects as pm
+
+    with session() as s:
+        return pm.pipeline(s)
+
+
+@router.post("/contacts")
+async def create_contact(body: dict[str, Any]):
+    return await _tool("add_contact", body)
+
+
+@router.patch("/contacts/{contact_id}")
+async def patch_contact(contact_id: int, body: dict[str, Any]):
+    return await _tool("update_contact", {**body, "contact": str(contact_id)})
+
+
+@router.delete("/contacts/{contact_id}")
+def remove_contact(contact_id: int):
+    from ..db import Contact
+
+    with session() as s:
+        c = s.get(Contact, contact_id)
+        if c:
+            s.delete(c)
+    bus.publish("data_changed", ["contacts"])
+    return {"deleted": contact_id}
+
+
 # ---------------------------------------------------------------- habits & commitments
 @router.get("/habits")
 def list_habits():
@@ -562,12 +638,13 @@ def list_reports():
 
 class ReportBody(BaseModel):
     week_offset: int = 0
+    project_id: int | None = None
 
 
 @router.post("/reports/generate")
 async def gen_report(body: ReportBody):
     async with core.lock:
-        rep = await reports.generate(body.week_offset)
+        rep = await reports.generate(body.week_offset, project_id=body.project_id)
     bus.publish("data_changed", ["reports"])
     return {"report": serialize.report(rep)}
 

@@ -20,9 +20,9 @@ def run(c):
     return asyncio.run(c)
 
 
-def ex(name, **args):
+def ex(_tool, **args):
     ctx = tools.Ctx(channel="web", turn_id="t-test")
-    res = run(tools.execute(name, args, ctx))
+    res = run(tools.execute(_tool, args, ctx))
     tools.finalize(ctx)
     return res
 
@@ -415,7 +415,7 @@ def test_forwarded_message_and_document(monkeypatch, fake_llm):
         "chat": {"id": 42, "type": "private"}, "caption": "",
         "forward_origin": {"type": "chat", "sender_chat": {"title": "گروه پایگاه داده"}},
         "document": {"file_id": "f1", "mime_type": "text/plain", "file_name": "hw.txt", "file_size": 50}}}))
-    turn = fake_llm.calls[-1]["messages"][-1]["content"]
+    turn = fake_llm.calls[0]["messages"][-1]["content"]
     assert "گروه پایگاه داده" in turn and "فصل ۴" in turn
 
 
@@ -517,3 +517,117 @@ def test_eval_harness_runs_with_scripted_model(tmp_path, fake_llm):
     assert res["passed"] == res["total"] == 2
     report = evals.render([res])
     assert "model-x" in report and "2/2" in report
+
+
+
+# ---------------------------------------------------------------- robustness (bugs seen in production)
+def test_add_task_survives_bad_model_arguments():
+    """A guessed goal id, priority words and Persian digits used to crash the save (FOREIGN KEY failed)."""
+    r = ex("add_task", title="داکیومنت بخش گیم", category="work", due="امشب", goal_id=7, priority="high",
+           estimated_minutes="۱۲۰", project_name="ماشین")
+    assert "error" not in r, r
+    t = r["task"]
+    assert t["due"] == "2026-10-19 23:59" and t["priority"] == 1 and t["estimated_minutes"] == 120
+    assert t["goal_id"] is None
+    assert any("goal_id=7" in w for w in r["warnings"]) and any("project_name" in w for w in r["warnings"])
+    r = ex("add_task", title="تموم کردن توکن‌های کلاد", due="قبل ۵ نوامبر")
+    assert r["task"]["due"] == "2026-11-05 23:59"
+
+
+def test_projects_with_nicknames_link_tasks_and_time():
+    ex("add_project", name="tahami supercars", aliases=["پروژه ماشین", "ماشین"], client="آقای طهامی")
+    ex("add_project", name="پروژه عبدالله‌زاده", aliases=["پروژه تنیس", "تنیس"])
+    r = ex("add_task", title="داکیومنت گیم", project="پروژه ماشین", due="2026-10-19 23:59")
+    assert r["task"]["project_id"] == 1 and r["task"]["category"] == "work"
+    r = ex("add_task", title="صفحه رزرو زمین", project="تنیس")
+    assert r["task"]["project_id"] == 2
+    ex("log_work", description="کار روی دیتابیس", minutes=90, project="tahami")
+    from app import projects
+
+    with session() as s:
+        assert projects.resolve(s, "پروژه‌ی ماشین").id == 1
+        assert projects.resolve(s, "عبدالله زاده").id == 2
+        d = projects.project_dict(s, s.get(projects.Project, 1))
+        assert d["open_tasks"] == 1 and d["minutes_this_week"] == 90
+    r = ex("add_task", title="x", project="پروژه ناشناخته")
+    assert r["task"]["project_id"] is None and "not found" in r["warnings"][0]
+    # adding the same project again merges nicknames instead of duplicating
+    r = ex("add_project", name="Tahami Supercars", aliases=["tahami"])
+    assert "tahami" in r["project"]["aliases"]
+    with session() as s:
+        assert s.query(projects.Project).count() == 2
+
+
+def test_supervisor_pipeline_followup(clock, fake_llm):
+    ex("add_contact", name="Prof. Jane Smith", organization="University of Toronto", field="distributed systems")
+    r = ex("update_contact", contact="jane smith", status="contacted")
+    c = r["contact"]
+    assert c["status"] == "contacted" and c["next_followup"] == "2026-10-29 10:00"
+    with session() as s:
+        followups.generate(s, now=datetime(2026, 10, 28, 12, 0))
+        assert s.query(Followup).filter(Followup.kind == "contact_followup").count() == 1
+    clock.value = datetime(2026, 10, 29, 10, 1)
+    fake_llm.script = [ChatResult(content="۱۰ روز از ایمیلت گذشته...")]
+    run(proactive.tick())
+    with session() as s:
+        m = s.query(Message).filter(Message.kind == "contact_followup").one()
+        assert "متن پیگیری رو بنویس" in m.meta["quick_replies"]
+    # a reply clears the follow-up
+    ex("update_contact", contact="Smith", status="replied")
+    with session() as s:
+        assert s.query(projects_contact()).one().next_followup_at is None
+
+
+def projects_contact():
+    from app.db import Contact
+
+    return Contact
+
+
+def test_claimed_save_without_tool_call_gets_corrected(fake_llm):
+    fake_llm.script = [
+        ChatResult(content="عالی! همه رو ذخیره کردم ✅"),  # hallucinated save
+        call("remember", content="برنامه‌نویس بک‌اند است", category="work"),
+        ChatResult(content="به خاطر سپردم ✅"),
+    ]
+    _, reply = run(core.handle_user_message("من برنامه‌نویس بک‌اندم", "web"))
+    assert reply["content"] == "به خاطر سپردم ✅"
+    assert "system check" in fake_llm.calls[1]["messages"][-1]["content"]
+    with session() as s:
+        assert s.query(Memory).one().content == "برنامه‌نویس بک‌اند است"
+
+
+def test_natural_dates():
+    from app import timeutil
+
+    assert timeutil.parse_datetime("فردا شب ساعت ۹") == datetime(2026, 10, 20, 21, 0)
+    assert timeutil.parse_datetime("۵ آبان ساعت ۹ صبح") == datetime(2026, 10, 27, 9, 0)
+    assert timeutil.parse_datetime("پنجشنبه ساعت ۵ عصر") == datetime(2026, 10, 22, 17, 0)
+    assert timeutil.parse_datetime("tomorrow 7pm") == datetime(2026, 10, 20, 19, 0)
+    assert timeutil.parse_date("۱۵ اسفند") == date(2027, 3, 6)
+    with pytest.raises(ValueError):
+        timeutil.parse_datetime("یه وقتی")
+
+
+def test_project_and_contact_api_and_project_report(fake_llm):
+    from fastapi.testclient import TestClient
+
+    from app.llm import LLMError
+    from app.main import create_app
+
+    with TestClient(create_app()) as c:
+        p = c.post("/api/projects", json={"name": "tahami supercars", "aliases": ["پروژه ماشین"], "client": "طهامی"}).json()["project"]
+        c.post("/api/tasks", json={"title": "داکیومنت گیم", "project": "پروژه ماشین"})
+        assert c.get(f"/api/tasks?project_id={p['id']}").json()["tasks"][0]["project"] == "tahami supercars"
+        c.patch(f"/api/projects/{p['id']}", json={"aliases": ["ماشین", "tahami"]})
+        assert c.get("/api/projects").json()["projects"][0]["aliases"] == ["ماشین", "tahami"]
+        ct = c.post("/api/contacts", json={"name": "Dr. Ali Rezaei", "organization": "McGill"}).json()["contact"]
+        assert c.patch(f"/api/contacts/{ct['id']}", json={"status": "contacted"}).json()["contact"]["next_followup"]
+        assert c.get("/api/contacts").json()["counts"]["contacted"] == 1
+
+        async def boom(*a, **k):
+            raise LLMError("offline")
+
+        fake_llm.chat = boom
+        r = c.post("/api/reports/generate", json={"week_offset": 0, "project_id": p["id"]}).json()["report"]
+        assert r["project_id"] == p["id"] and "tahami supercars" in r["work_report"]

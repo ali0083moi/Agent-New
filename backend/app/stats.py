@@ -30,6 +30,10 @@ def productivity(s: Session, start_date: date, end_date: date) -> dict[str, Any]
     per_day: dict[str, int] = defaultdict(int)
     per_cat: dict[str, int] = defaultdict(int)
     per_task: dict[str, int] = defaultdict(int)
+    per_project: dict[str, int] = defaultdict(int)
+    from .db import Project
+
+    project_names = {p.id: p.name for p in s.query(Project).all()}
     unproductive = 0
     entries = []
     for lg in logs:
@@ -43,6 +47,9 @@ def productivity(s: Session, start_date: date, end_date: date) -> dict[str, Any]
         per_cat[lg.category] += minutes
         title = tasks_by_id[lg.task_id].title if lg.task_id in tasks_by_id else (lg.description or "بدون عنوان")
         per_task[title] += minutes
+        pid = lg.project_id or (tasks_by_id[lg.task_id].project_id if lg.task_id in tasks_by_id else None)
+        if pid in project_names:
+            per_project[project_names[pid]] += minutes
         entries.append(
             {
                 "date": lg.start_at.date().isoformat(),
@@ -50,6 +57,7 @@ def productivity(s: Session, start_date: date, end_date: date) -> dict[str, Any]
                 "minutes": minutes,
                 "category": lg.category,
                 "task": title,
+                "project": project_names.get(pid) if pid else None,
                 "description": lg.description,
             }
         )
@@ -100,11 +108,13 @@ def productivity(s: Session, start_date: date, end_date: date) -> dict[str, Any]
             for k, v in sorted(per_cat.items(), key=lambda x: -x[1])
         ],
         "by_task": [{"task": k, "minutes": v} for k, v in sorted(per_task.items(), key=lambda x: -x[1])][:20],
+        "by_project": [{"project": k, "minutes": v} for k, v in sorted(per_project.items(), key=lambda x: -x[1])],
         "completed_tasks": [
             {
                 "id": t.id,
                 "title": t.title,
                 "category": t.category,
+                "project": project_names.get(t.project_id) if t.project_id else None,
                 "completed_at": timeutil.iso(t.completed_at),
                 "notes": t.notes,
             }

@@ -26,10 +26,16 @@ def task(s: Session, t: Task, with_time: bool = True) -> dict[str, Any]:
         "recurring_event_id": t.recurring_event_id,
         "goal_id": t.goal_id,
         "parent_id": t.parent_id,
+        "project_id": t.project_id,
         "energy": t.energy or "normal",
         "created_at": timeutil.iso(t.created_at),
         "completed_at": timeutil.iso(t.completed_at),
     }
+    if t.project_id:
+        from .db import Project
+
+        p = s.get(Project, t.project_id)
+        d["project"] = p.name if p else None
     if with_time:
         d["spent_minutes"] = planner.spent_minutes(s, t.id)
         d["remaining_minutes"] = planner.remaining_minutes(s, t)
@@ -124,6 +130,7 @@ def report(r: Report) -> dict[str, Any]:
         "id": r.id,
         "week_start": r.week_start.isoformat(),
         "week_end": r.week_end.isoformat(),
+        "project_id": r.project_id,
         "label": f"{timeutil.fa_date(r.week_start, with_weekday=False)} تا {timeutil.fa_date(r.week_end, with_weekday=False, with_year=True)}",
         "work_report": r.work_report,
         "personal_report": r.personal_report,

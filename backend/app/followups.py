@@ -14,7 +14,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from . import cal, insights, planner, prefs, stats, timeutil
-from .db import Followup, Habit, HabitLog, Message, PlannedBlock, RecurringEvent, Task, VocabWord
+from .db import Contact, Followup, Habit, HabitLog, Message, PlannedBlock, RecurringEvent, Task, VocabWord
 
 log = logging.getLogger(__name__)
 
@@ -42,6 +42,7 @@ MAX_DELAY = {
     "weekly_planning": timedelta(hours=6),
     "habit_reminder": timedelta(hours=3),
     "vocab_review": timedelta(hours=6),
+    "contact_followup": timedelta(days=3),
 }
 
 
@@ -197,6 +198,14 @@ def generate(s: Session, now: datetime | None = None) -> int:
         if at > now - MAX_DELAY["vocab_review"] and _ensure(s, f"vocab_review:{now.date().isoformat()}", "vocab_review", at):
             n += 1
 
+    # 6c) supervisor search: follow up on emails that got no reply
+    for c in s.query(Contact).filter(Contact.next_followup_at.is_not(None), Contact.next_followup_at <= horizon,
+                                     Contact.status.in_(["contacted", "to_contact"])).all():
+        at = max(c.next_followup_at, timeutil.at(c.next_followup_at.date(), p["work_start"]))
+        if _ensure(s, f"contact:{c.id}:{timeutil.iso(c.next_followup_at)}", "contact_followup", at, contact_id=c.id,
+                   payload={"next": timeutil.iso(c.next_followup_at)}):
+            n += 1
+
     # 7) rescue mode: the workload no longer fits before the deadlines (checked every 10 minutes)
     global _last_rescue_check
     if p.get("rescue_mode", True) and not is_quiet(now, p) and (
@@ -317,6 +326,10 @@ def _still_valid(s: Session, f: Followup, now: datetime) -> bool:
         done = s.query(func.coalesce(func.sum(HabitLog.value), 0)).filter(HabitLog.habit_id == h.id,
                                                                            HabitLog.day == now.date()).scalar()
         if (done or 0) >= h.target:
+            return False
+    if f.kind == "contact_followup":
+        c = s.get(Contact, f.contact_id) if f.contact_id else None
+        if c is None or timeutil.iso(c.next_followup_at) != (f.payload or {}).get("next"):
             return False
     if f.kind == "vocab_review" and not s.query(VocabWord.id).filter(VocabWord.due <= now.date()).first():
         return False

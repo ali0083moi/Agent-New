@@ -38,6 +38,8 @@ export type Task = {
   notes: string;
   recurring_event_id: number | null;
   parent_id: number | null;
+  project_id: number | null;
+  project?: string | null;
   energy: "high" | "normal" | "low";
   spent_minutes: number;
   remaining_minutes: number;
@@ -45,6 +47,34 @@ export type Task = {
   subtasks_total?: number;
   subtasks_done?: number;
   completed_at: string | null;
+};
+
+export type Project = {
+  id: number;
+  name: string;
+  aliases: string[];
+  category: string;
+  client: string;
+  description: string;
+  status: "active" | "paused" | "done";
+  open_tasks: number;
+  minutes_this_week: number;
+  next_deadline: { title: string; due: string } | null;
+};
+
+export type Contact = {
+  id: number;
+  name: string;
+  organization: string;
+  field: string;
+  email: string;
+  url: string;
+  status: string;
+  status_fa: string;
+  last_contact: string | null;
+  days_since_contact: number | null;
+  next_followup: string | null;
+  notes: string;
 };
 
 export type Habit = {
@@ -225,6 +255,7 @@ export type Stats = {
 
 export type Report = {
   id: number;
+  project_id: number | null;
   week_start: string;
   week_end: string;
   label: string;
@@ -269,6 +300,7 @@ export type SettingsData = {
 
 export type Me = {
   now?: string;
+  version?: string | null;
   auth_required: boolean;
   authenticated: boolean;
   llm_configured?: boolean;

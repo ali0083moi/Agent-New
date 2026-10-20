@@ -237,6 +237,28 @@ def build(f: Followup) -> tuple[str, str, list[str]] | None:
             fallback = "📇 مرور لغت امروز — معنی این‌ها چیه؟\n" + "\n".join(f"{timeutil.fa_digits(i + 1)}. {w.word}" for i, w in enumerate(words))
             return instr, fallback, ["بلد نیستم، معنی‌ها رو بگو"]
 
+        if f.kind == "contact_followup":
+            from ..db import Contact
+            from .. import projects as projects_mod
+
+            c = s.get(Contact, f.contact_id) if f.contact_id else None
+            if c is None:
+                return None
+            d = projects_mod.contact_dict(c)
+            if c.status == "to_contact":
+                instr = (f"Supervisor search: it's time to email {c.name} ({c.organization}, {c.field}). Remind the user and "
+                         "offer to draft a tailored cold email in English (short, specific to their research). "
+                         f"Contact: {d}")
+                fallback = f"🎓 قرار بود به {c.name} ({c.organization}) ایمیل بزنی. متن ایمیل رو برات بنویسم؟"
+                return instr, fallback, ["متن ایمیل رو بنویس", "فرستادم ✅", "بعداً"]
+            instr = (f"Supervisor search follow-up: {d['days_since_contact']} days since the user emailed {c.name} "
+                     f"({c.organization}) and no reply is recorded. Ask if they got a reply; if not, offer to draft a "
+                     "short polite follow-up email in English (reference the first email, add one new detail). "
+                     f"When the user answers, update the contact with update_contact. Contact: {d}")
+            fallback = (f"🎓 {timeutil.fa_digits(d['days_since_contact'] or 0)} روز از ایمیلت به {c.name} گذشته. "
+                        "جواب داده؟ اگه نه، یه ایمیل پیگیری کوتاه برات بنویسم؟")
+            return instr, fallback, ["جواب داده", "متن پیگیری رو بنویس", "بیخیالش"]
+
         if f.kind == "custom":
             extra = f" Related task: {_task_line(s, t)}." if t else ""
             instr = f"Reminder the user (or you) scheduled: «{f.note}».{extra} Deliver it naturally."

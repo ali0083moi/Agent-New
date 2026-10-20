@@ -532,6 +532,18 @@ def test_add_task_survives_bad_model_arguments():
     assert any("goal_id=7" in w for w in r["warnings"]) and any("project_name" in w for w in r["warnings"])
     r = ex("add_task", title="تموم کردن توکن‌های کلاد", due="قبل ۵ نوامبر")
     assert r["task"]["due"] == "2026-11-05 23:59"
+    r = ex("add_task", title="x", goal_id="پروژه ماشین")
+    assert r["task"]["goal_id"] is None
+
+
+def test_foreign_key_failure_still_saves_the_task(monkeypatch):
+    """Even if a bad link reaches the database, the task is saved without it instead of failing."""
+    monkeypatch.setattr(tools, "_check_refs", lambda s, spec, args: [])
+    r = ex("add_task", title="داکیومنت گیم", goal_id=7, priority=1)
+    assert "error" not in r, r
+    assert r["task"]["goal_id"] is None and any("goal_id" in w for w in r["warnings"])
+    with session() as s:
+        assert [t.title for t in s.query(Task).all()] == ["داکیومنت گیم"]
 
 
 def test_projects_with_nicknames_link_tasks_and_time():

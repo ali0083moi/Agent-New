@@ -178,12 +178,19 @@ async def execute(name: str, raw_args: str | dict[str, Any], ctx: Ctx) -> dict[s
     if missing:
         return {"error": f"missing required argument(s): {', '.join(missing)}", "notes": notes}
     try:
-        if inspect.iscoroutinefunction(spec.fn):
-            result = await spec.fn(ctx=ctx, **args)
-        else:
-            with session() as s:
-                notes += _check_refs(s, spec, args)
-                result = spec.fn(s, ctx=ctx, **args)
+        try:
+            result = await _call(spec, args, ctx, notes)
+        except IntegrityError as e:
+            # a link the checks missed still points nowhere: save without the optional links rather than not at all
+            required = set(spec.parameters.get("required", []))
+            dropped = [k for k in args if k in REF_MODELS and k not in required]
+            if not dropped:
+                raise
+            log.warning("tool %s integrity error, retrying without %s: %s", name, dropped, e)
+            for k in dropped:
+                args.pop(k)
+            notes.append(f"saved without {', '.join(dropped)} (the linked item does not exist)")
+            result = await _call(spec, args, ctx, notes)
         if isinstance(result, dict) and result.get("needs_confirmation"):
             return result
         ctx.changed.update(spec.changes)
@@ -203,6 +210,14 @@ async def execute(name: str, raw_args: str | dict[str, Any], ctx: Ctx) -> dict[s
     except Exception as e:  # noqa: BLE001
         log.exception("tool %s failed", name)
         return {"error": str(e), "notes": notes}
+
+
+async def _call(spec: "ToolSpec", args: dict[str, Any], ctx: Ctx, notes: list[str]) -> Any:
+    if inspect.iscoroutinefunction(spec.fn):
+        return await spec.fn(ctx=ctx, **args)
+    with session() as s:
+        notes += _check_refs(s, spec, args)
+        return spec.fn(s, ctx=ctx, **args)
 
 
 def finalize(ctx: Ctx) -> None:

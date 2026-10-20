@@ -65,7 +65,7 @@ def get_settings() -> Settings:
 
 
 def version() -> dict:
-    """Release info written by CI (VERSION.json at the repo/release root); empty in development."""
+    """Build info (VERSION.json, written when the Docker image is built by the deploy); empty in development."""
     import json
 
     f = ROOT_DIR / "VERSION.json"

@@ -1,25 +1,25 @@
 name: CI/CD
 
-# Every push runs the tests. Pushes to the default branch that pass are published to the `release` branch
-# (backend + pre-built web UI). Servers installed with deploy/install.sh pull `release` and update themselves.
+# Every push runs the backend tests and the web build. A push to the default branch that passes is deployed
+# to the server over SSH (job "deploy"): the code is updated, the Docker image is rebuilt and the container
+# recreated, then the new version is health-checked and rolled back if it doesn't come up
+# (deploy/docker-deploy.sh). Server access comes from repository secrets — see "Automatic deploy" in README.
 
 on:
   push:
-    branches-ignore: [release]
   pull_request:
   workflow_dispatch:
 
 permissions:
-  contents: write
-
-concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  contents: read
 
 jobs:
   backend:
     name: Backend tests
     runs-on: ubuntu-latest
+    concurrency:
+      group: backend-${{ github.ref }}
+      cancel-in-progress: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -36,6 +36,9 @@ jobs:
   frontend:
     name: Web UI build
     runs-on: ubuntu-latest
+    concurrency:
+      group: frontend-${{ github.ref }}
+      cancel-in-progress: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -49,57 +52,63 @@ jobs:
       - name: Typecheck & build
         working-directory: frontend
         run: npm run build
-      - uses: actions/upload-artifact@v4
-        with:
-          name: web-dist
-          path: frontend/dist
-          retention-days: 7
 
-  release:
-    name: Publish release branch
+  deploy:
+    name: Deploy to server
     needs: [backend, frontend]
     if: github.event_name != 'pull_request' && github.ref_name == github.event.repository.default_branch
     runs-on: ubuntu-latest
+    # one deploy at a time, and never cancelled halfway
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    env:
+      DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+      DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+      DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+      DEPLOY_PASSWORD: ${{ secrets.DEPLOY_PASSWORD }}
+      DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+      DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+      DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
     steps:
+      - name: Check server settings
+        id: cfg
+        run: |
+          if [ -z "$DEPLOY_HOST" ] || { [ -z "$DEPLOY_PASSWORD" ] && [ -z "$DEPLOY_SSH_KEY" ]; }; then
+            echo "::warning title=Deploy skipped::Add the DEPLOY_HOST and DEPLOY_PASSWORD (or DEPLOY_SSH_KEY) repository secrets to deploy automatically."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
       - uses: actions/checkout@v4
+        if: steps.cfg.outputs.ready == 'true'
         with:
           fetch-depth: 0
-      - uses: actions/download-artifact@v4
-        with:
-          name: web-dist
-          path: frontend/dist
-      - name: Assemble release tree
+      - name: Deploy over SSH
+        if: steps.cfg.outputs.ready == 'true'
         run: |
           set -euo pipefail
-          mkdir -p out
-          rsync -a --exclude '__pycache__' --exclude '.pytest_cache' --exclude '.venv' backend out/
-          mkdir -p out/frontend && rsync -a frontend/dist out/frontend/
-          rsync -a deploy out/
-          cp .env.example README.md out/
-          SUBJECT="$(git log -1 --pretty=%s)"
-          python3 - "$GITHUB_SHA" "$SUBJECT" > out/VERSION.json <<'PY'
-          import json, sys, datetime as dt
-          print(json.dumps({"sha": sys.argv[1], "short": sys.argv[1][:7], "subject": sys.argv[2],
-                            "built_at": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}, ensure_ascii=False))
-          PY
-      - name: Push to release branch
-        run: |
-          set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if git ls-remote --exit-code --heads origin release >/dev/null; then
-            git fetch origin release
-            git worktree add rel origin/release
-            git -C rel checkout -B release
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          opts=(-p "${DEPLOY_PORT:-22}" -o ConnectTimeout=30 -o ServerAliveInterval=20 -o ServerAliveCountMax=9)
+          if [ -n "$DEPLOY_KNOWN_HOSTS" ]; then
+            printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+            opts+=(-o StrictHostKeyChecking=yes)
           else
-            git worktree add --orphan -b release rel
+            opts+=(-o StrictHostKeyChecking=accept-new)
           fi
-          rsync -a --delete --exclude .git out/ rel/
-          cd rel
-          git add -A
-          if git diff --cached --quiet; then
-            echo "nothing changed"
-            exit 0
+          if [ -n "$DEPLOY_SSH_KEY" ]; then
+            printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key && chmod 600 ~/.ssh/deploy_key
+            ssh=(ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes "${opts[@]}")
+          else
+            sudo apt-get install -y -qq sshpass >/dev/null
+            export SSHPASS="$DEPLOY_PASSWORD"
+            ssh=(sshpass -e ssh -o PreferredAuthentications=password,keyboard-interactive -o PubkeyAuthentication=no "${opts[@]}")
           fi
-          git commit -q -m "release ${GITHUB_SHA::7}: $(git -C .. log -1 --pretty=%s)"
-          git push origin release
+          target="${DEPLOY_USER:-root}@$DEPLOY_HOST"
+
+          # the server gets the code from this job, so it doesn't need access to GitHub
+          git branch -f deploy-tip HEAD
+          git bundle create repo.bundle deploy-tip
+          "${ssh[@]}" "$target" 'mkdir -p /tmp/peygir-deploy && cat > /tmp/peygir-deploy/repo.bundle' < repo.bundle
+          "${ssh[@]}" "$target" 'cat > /tmp/peygir-deploy/deploy.sh' < deploy/docker-deploy.sh
+          "${ssh[@]}" "$target" "DEPLOY_PATH=$(printf %q "${DEPLOY_PATH:-}") bash /tmp/peygir-deploy/deploy.sh run $GITHUB_SHA /tmp/peygir-deploy/repo.bundle"

@@ -16,6 +16,12 @@ COPY backend/requirements.txt backend/requirements.txt
 RUN pip install -r backend/requirements.txt
 COPY backend/ backend/
 COPY --from=web /web/dist frontend/dist
+# version shown in the app and checked by the deploy (deploy/docker-deploy.sh passes these)
+ARG GIT_SHA=""
+ARG GIT_SUBJECT=""
+RUN if [ -n "$GIT_SHA" ]; then python -c "import json, os; sha = os.environ['GIT_SHA']; \
+json.dump({'sha': sha, 'short': sha[:7], 'subject': os.environ.get('GIT_SUBJECT', '')}, \
+open('/app/VERSION.json', 'w'), ensure_ascii=False)"; fi
 WORKDIR /app/backend
 EXPOSE 8000
 VOLUME ["/app/data"]

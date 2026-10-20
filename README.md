@@ -110,29 +110,37 @@ make run         # بیلد رابط وب و اجرای سرور روی پورت
 
 دستورها: `/today` `/tasks` `/plan` `/stats` `/habits` `/ielts` `/vocab` `/report` `/undo` `/stop`. لازم هم نیست؛ هر چیزی را عادی بنویس یا ویس بفرست.
 
-### ۵) نصب روی سرور با به‌روزرسانی خودکار (CI/CD)
-هر push روی برنچ اصلی در GitHub Actions تست و بیلد می‌شود (`.github/workflows/ci.yml`). اگر همه چیز سبز بود، نسخه آماده (بک‌اند + رابط وب بیلدشده) روی برنچ `release` منتشر می‌شود. سرور هر دقیقه آن برنچ را نگاه می‌کند و نسخه جدید را خودش نصب می‌کند.
+### ۵) استقرار خودکار با هر push (CI/CD)
+هر push در GitHub Actions اول تست‌ها و بیلد رابط وب را اجرا می‌کند (`.github/workflows/ci.yml`). اگر روی برنچ اصلی بود و همه سبز شد، Actions با SSH به سرور وصل می‌شود و `deploy/docker-deploy.sh` را اجرا می‌کند:
+1. کد جدید را در همان پوشه نصب Docker روی سرور می‌گذارد. کد از خود Actions فرستاده می‌شود، پس سرور لازم نیست به GitHub دسترسی داشته باشد.
+2. از دیتابیس **پشتیبان** می‌گیرد (۱۵ تای آخر در `data/backups`).
+3. ایمیج را دوباره بیلد می‌کند و کانتینر را از نو می‌سازد.
+4. صبر می‌کند تا **نسخه جدید** جواب بدهد. اگر بالا نیامد، **خودکار به ایمیج قبلی برمی‌گردد** و اجرای Actions قرمز می‌شود. اگر بیلد خطا بدهد، نسخه در حال اجرا اصلاً دست نمی‌خورد.
+5. بعد از هر نصب موفق، پیام «🚀 نسخه جدید نصب شد» در تلگرام می‌آید. نسخه فعلی پایین منوی وب نوشته شده است.
 
-نصب یک‌باره روی سرور (Ubuntu/Debian با systemd):
-```bash
-curl -fsSL https://raw.githubusercontent.com/ali0083moi/Agent-New/release/deploy/install.sh -o /tmp/peygir-install.sh
-sudo bash /tmp/peygir-install.sh
-```
-- **نصب قبلی را پیدا می‌کند** (کانتینر Docker یا پروسه `app.main`). فایل `.env` و دیتابیس را به `/opt/peygir/shared` منتقل می‌کند و روی همان پورت قبلی بالا می‌آید. نسخه قبلی حذف نمی‌شود، فقط متوقف می‌شود.
-- پورت را با `sudo PEYGIR_PORT=9000 bash /tmp/peygir-install.sh` عوض کن.
-- قبل از هر به‌روزرسانی از دیتابیس **پشتیبان** گرفته می‌شود (۱۵ تای آخر در `/opt/peygir/shared/backups`).
-- بعد از هر نصب **سلامت برنامه چک می‌شود**. اگر نسخه جدید بالا نیامد، **خودکار به نسخه قبل برمی‌گردد**.
-- بعد از هر نصب موفق، پیام «🚀 نسخه جدید نصب شد» در تلگرام می‌آید. نسخه فعلی پایین منوی وب نوشته شده است.
+`.env`، پوشه `data/` و `docker-compose.yml` ویرایش‌شده روی سرور حفظ می‌شوند. تغییرات دستی دیگر روی فایل‌های کد در `.deploy/local-changes-*.patch` ذخیره و بعد با کد جدید جایگزین می‌شوند.
 
-| کار | دستور |
+**راه‌اندازی (یک بار):** در GitHub برو به **Settings ← Secrets and variables ← Actions ← New repository secret** و این‌ها را اضافه کن:
+
+| Secret | مقدار |
 |---|---|
-| لاگ برنامه | `journalctl -u peygir -f` |
-| لاگ به‌روزرسانی‌ها | `journalctl -u peygir-update -f` |
-| تغییر تنظیمات | ویرایش `/opt/peygir/shared/.env`، سپس `systemctl restart peygir` |
-| به‌روزرسانی فوری | `systemctl start peygir-update` |
-| توقف به‌روزرسانی خودکار | `systemctl disable --now peygir-update.timer` |
+| `DEPLOY_HOST` | آی‌پی یا دامنه سرور |
+| `DEPLOY_PORT` | پورت SSH (پیش‌فرض 22) |
+| `DEPLOY_USER` | کاربر SSH (پیش‌فرض `root`) |
+| `DEPLOY_SSH_KEY` | کلید خصوصی SSH (پیشنهادی) — یا به‌جایش `DEPLOY_PASSWORD` |
+| `DEPLOY_KNOWN_HOSTS` | اختیاری: خروجی `ssh-keyscan -p <port> <host>` تا هویت سرور چک شود |
+| `DEPLOY_PATH` | اختیاری: پوشه پروژه روی سرور. اگر نگذاری، از روی کانتینر فعلی پیدا می‌شود. روی سرور خالی `/opt/Agent-New` است. |
 
-برای دامنه و HTTPS، یک reverse proxy (Caddy یا nginx) جلوی همین پورت بگذار.
+بعد از آن هر push خودکار نصب می‌شود. برای نصب دوباره همان نسخه، در تب **Actions** روی **Run workflow** بزن. تا وقتی این secretها نباشند، مرحله deploy با یک هشدار رد می‌شود و بقیه CI کار می‌کند.
+
+ساخت کلید SSH مخصوص deploy:
+```bash
+ssh-keygen -t ed25519 -f deploy_key -N ""           # روی کامپیوتر خودت
+ssh-copy-id -i deploy_key.pub -p <port> root@<host>   # کلید عمومی روی سرور
+# محتوای فایل deploy_key را در secret به نام DEPLOY_SSH_KEY بگذار
+```
+
+برای دامنه و HTTPS، یک reverse proxy (Caddy یا nginx) جلوی پورت کانتینر بگذار.
 
 ### ⚠️ کجا اجرا کنم؟ (تلگرام و GapGPT)
 - `api.telegram.org` از **داخل ایران** فیلتر است.

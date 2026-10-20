@@ -20,6 +20,9 @@ data/
 frontend/node_modules/
 frontend/dist/
 
+# server-side deploy state (deploy/docker-deploy.sh)
+.deploy/
+
 # misc
 .DS_Store
 *.log

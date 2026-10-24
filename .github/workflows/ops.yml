@@ -1,0 +1,64 @@
+name: Ops
+
+# Manual maintenance tasks on the server (Actions → Ops → Run workflow). Uses the same DEPLOY_* secrets as the
+# deploy. This repository is public, so these tasks only print numbers and synthetic test results, never user data.
+#   usage  — LLM calls, tokens and cost by purpose and model (python -m app.usage_report)
+#   evals  — compare models on the built-in test scenarios with the server's GapGPT key (python -m app.evals)
+
+on:
+  workflow_dispatch:
+    inputs:
+      task:
+        description: What to run
+        type: choice
+        options: [usage, evals]
+        default: usage
+      models:
+        description: "evals: comma-separated model ids"
+        default: "gpt-4.1,deepseek-v4-flash,gpt-5-mini"
+      scenarios:
+        description: "evals: optional subset of scenarios (comma-separated)"
+        default: ""
+      days:
+        description: "usage: how many days back"
+        default: "30"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ops
+  cancel-in-progress: false
+
+jobs:
+  run:
+    name: ${{ inputs.task }}
+    runs-on: ubuntu-latest
+    env:
+      DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+      DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+      DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+      DEPLOY_PASSWORD: ${{ secrets.DEPLOY_PASSWORD }}
+      DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+      DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+      TASK: ${{ inputs.task }}
+      MODELS: ${{ inputs.models }}
+      SCENARIOS: ${{ inputs.scenarios }}
+      DAYS: ${{ inputs.days }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run on the server
+        run: |
+          set -euo pipefail
+          safe='^[A-Za-z0-9._/,:-]*$'
+          [[ "$MODELS" =~ $safe && "$SCENARIOS" =~ $safe && "$DAYS" =~ ^[0-9]+$ ]] || { echo "invalid input"; exit 2; }
+          source deploy/ci-ssh.sh
+          case "$TASK" in
+            usage)
+              "${ssh[@]}" "$target" "docker exec peygir python -m app.usage_report --days $DAYS" ;;
+            evals)
+              args="--models $MODELS --out /tmp/evals-report.md"
+              [ -n "$SCENARIOS" ] && args="$args --scenarios $SCENARIOS"
+              "${ssh[@]}" "$target" "docker exec peygir python -m app.evals $args > /dev/null && docker exec peygir cat /tmp/evals-report.md" \
+                | tee "$GITHUB_STEP_SUMMARY" ;;
+          esac

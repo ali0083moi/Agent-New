@@ -88,23 +88,7 @@ jobs:
         if: steps.cfg.outputs.ready == 'true'
         run: |
           set -euo pipefail
-          mkdir -p ~/.ssh && chmod 700 ~/.ssh
-          opts=(-p "${DEPLOY_PORT:-22}" -o ConnectTimeout=30 -o ServerAliveInterval=20 -o ServerAliveCountMax=9)
-          if [ -n "$DEPLOY_KNOWN_HOSTS" ]; then
-            printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
-            opts+=(-o StrictHostKeyChecking=yes)
-          else
-            opts+=(-o StrictHostKeyChecking=accept-new)
-          fi
-          if [ -n "$DEPLOY_SSH_KEY" ]; then
-            printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key && chmod 600 ~/.ssh/deploy_key
-            ssh=(ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes "${opts[@]}")
-          else
-            sudo apt-get install -y -qq sshpass >/dev/null
-            export SSHPASS="$DEPLOY_PASSWORD"
-            ssh=(sshpass -e ssh -o PreferredAuthentications=password,keyboard-interactive -o PubkeyAuthentication=no "${opts[@]}")
-          fi
-          target="${DEPLOY_USER:-root}@$DEPLOY_HOST"
+          source deploy/ci-ssh.sh
 
           # the server gets the code from this job, so it doesn't need access to GitHub
           git branch -f deploy-tip HEAD

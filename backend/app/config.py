@@ -21,7 +21,9 @@ class Settings(BaseSettings):
     chat_model: str = "gemini-3.1-flash-lite"  # best score + cheap in the evals (Oct 2026)
     fast_model: str = "deepseek-v4-flash"
     vision_model: str = "gpt-4.1"
-    ielts_model: str = ""  # grading essays/speaking; empty = chat_model
+    # stronger, pricier model only for hard jobs: emails to professors, SOP/CV, weekly planning & report, IELTS grading
+    strong_model: str = "claude-sonnet-5-5"
+    ielts_model: str = ""  # grading essays/speaking; empty = strong_model
     transcribe_model: str = "gapgpt/whisper-1"
     tts_model: str = "gpt-4o-mini-tts"
     tts_voice: str = "nova"
@@ -31,6 +33,9 @@ class Settings(BaseSettings):
     transcribe_fallback_models: str = "whisper-1"
     tts_fallback_models: str = "tts-1"
     llm_timeout: float = 90.0
+    # Gmail over IMAP for the supervisor search (an App Password; can also be set in the web settings)
+    gmail_address: str = ""
+    gmail_app_password: str = ""
     llm_proxy: str = ""  # e.g. http://user:pass@host:port — if GapGPT isn't reachable directly
     llm_streaming: bool = True
     # optional price overrides: {"model": [input_per_1M, output_per_1M]}

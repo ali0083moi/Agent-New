@@ -66,7 +66,10 @@ DEFAULTS: dict[str, Any] = {
     "llm_fast_model": "",
     "llm_vision_model": "",
     "llm_ielts_model": "",
+    "llm_strong_model": "",
     "llm_fallback_models": "",  # comma separated; '' = FALLBACK_MODELS from .env
+    # Google Calendar feed published at /cal/<token>.ics (see calsync.py)
+    "ics_include": ["classes", "events", "blocks", "deadlines", "trips"],
 }
 
 # cheap models that did best in the evals (python -m app.evals, Oct 2026): written once into the settings of
@@ -80,7 +83,9 @@ RECOMMENDED_MODELS = {
 
 # app state keys (not user preferences)
 STATE_KEYS = {"telegram_chat_id", "telegram_user", "telegram_offset", "pairing_code", "last_user_message_at",
-              "current_session_id", "model_defaults_version"}
+              "current_session_id", "model_defaults_version", "gcal_last_sync", "mail_state"}
+# secrets: not in DEFAULTS, so they are never returned by the settings API nor settable by the model
+SECRET_KEYS = {"gcal_ics_urls", "ics_token", "gmail_address", "gmail_app_password"}
 
 
 def get(key: str, default: Any = None, s: Session | None = None) -> Any:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -22,18 +23,23 @@ log = logging.getLogger("peygir")
 async def scheduler_loop() -> None:
     from .agent import proactive
 
-    from . import jobs, memory
+    from . import calsync, jobs, mail, memory
 
     interval = get_settings().scheduler_interval_seconds
     await asyncio.sleep(3)
     await announce_new_version()
     n = 0
+    last_external = 0.0
     while True:
         try:
             await proactive.tick()
             if n % 20 == 0:  # every ~10 minutes: catch up on memory indexing and summaries
                 jobs.spawn("index", memory.index_pending)
                 jobs.spawn("summary", memory.summarize_old)
+            if time.monotonic() - last_external >= 900:  # every 15 minutes: Google Calendar + Gmail
+                last_external = time.monotonic()
+                jobs.spawn("calendar", calsync.sync)
+                jobs.spawn("mail", mail.check)
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001
@@ -93,6 +99,23 @@ def create_app() -> FastAPI:
 
     uploads = Path(st.upload_dir)
     uploads.mkdir(parents=True, exist_ok=True)
+
+    @app.get("/cal/{token}.ics", include_in_schema=False)
+    async def calendar_feed(token: str):
+        """Private iCal feed for Google Calendar ("From URL"); the secret token is the only access check."""
+        import hmac
+
+        from fastapi import Response
+
+        from . import calsync, prefs
+
+        with db.session() as s:
+            expected = prefs.get("ics_token", s=s)
+            if not expected or not hmac.compare_digest(token, expected):
+                return JSONResponse({"detail": "not found"}, status_code=404)
+            body = calsync.build_feed(s)
+        return Response(body, media_type="text/calendar; charset=utf-8",
+                        headers={"Cache-Control": "no-cache", "Content-Disposition": 'inline; filename="peygir.ics"'})
 
     @app.get("/uploads/{name}", include_in_schema=False, dependencies=[Depends(auth.require_auth)])
     async def upload_file(name: str):

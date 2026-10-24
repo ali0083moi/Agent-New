@@ -148,7 +148,8 @@ def test_every_tool_belongs_to_core_or_a_group():
 def test_group_selection():
     assert toolsets.select(["فردا ساعت ۵ جلسه دارم"]) == ["schedule"]
     assert toolsets.select(["این رایتینگ تسک ۲ رو تصحیح کن"]) == ["ielts"]
-    assert "projects" in toolsets.select(["به استاد اسمیت ایمیل زدم"])
+    assert "apply" in toolsets.select(["به استاد اسمیت ایمیل زدم"])
+    assert toolsets.select(["پروژه ماشین رو جلو بردم"]) == ["projects"]
     assert "places" in toolsets.select(["از خونه تا شرکت ۴۰ دقیقه طول می‌کشه"])
     assert toolsets.select(["سلام خوبی؟"]) == []
     assert toolsets.select(["باشه"], kinds=["habit_reminder"]) == ["habits"]
@@ -188,8 +189,8 @@ def _setup_places():
     ex("set_place", name="شرکت", kind="work", aliases=["دفتر"])
     ex("set_place", name="دانشگاه شریف", kind="university", aliases=["دانشگاه"])
     ex("set_travel_time", from_place="خونه", to_place="شرکت", minutes=40, mode="metro")
-    ex("set_travel_time", from_place="خونه", to_place="دانشگاه", minutes=60)
-    ex("set_travel_time", from_place="دفتر", to_place="دانشگاه شریف", minutes=30)
+    ex("set_travel_time", from_place="خونه", to_place="دانشگاه", minutes=60, mode="metro")
+    ex("set_travel_time", from_place="دفتر", to_place="دانشگاه شریف", minutes=30, mode="bus")
     prefs.set("prep_minutes", 30)
 
 
@@ -200,7 +201,7 @@ def test_place_resolution_and_observed_travel_time():
         assert places.resolve(s, "دفتر").name == "شرکت"
         assert places.resolve(s, "سینما") is None
     r = ex("set_travel_time", from_place="خانه", to_place="شرکت", minutes=60, observed=True)
-    assert r["travel"]["minutes"] == 50 and r["travel"]["averaged_from"] == 2
+    assert r["travel"]["usual_minutes"] == 50 and r["travel"]["logged_trip"]  # metro: averaged into the usual time
     r = ex("set_travel_time", from_place="خانه", to_place="سینما", minutes=10)
     assert "unknown place" in r["error"]
 
@@ -349,3 +350,82 @@ def test_user_choice_is_kept():
 def test_preferences_numbers_are_parsed():
     r = ex("update_preferences", changes={"prep_minutes": "۲۰ دقیقه", "session_idle_hours": "8", "daily_budget_usd": "0.5"})
     assert r["applied"] == {"prep_minutes": 20, "session_idle_hours": 8, "daily_budget_usd": 0.5}
+
+
+
+# ---------------------------------------------------------------- traffic & routing
+def test_car_trips_follow_traffic_by_hour(clock):
+    from app import routing
+
+    ex("set_place", name="خانه", kind="home")
+    ex("set_place", name="شرکت", kind="work")
+    ex("set_travel_time", from_place="خانه", to_place="شرکت", minutes=46, mode="taxi")  # usual (≈ rush hour) time
+    with session() as s:
+        a, b = places.resolve(s, "خانه"), places.resolve(s, "شرکت")
+        rush = places.travel(s, a, b, datetime(2026, 10, 19, 8, 0))  # Monday 08:00
+        night = places.travel(s, a, b, datetime(2026, 10, 19, 23, 0))
+        friday = places.travel(s, a, b, datetime(2026, 10, 23, 8, 0))
+    assert rush == round(46 / routing.TYPICAL_FACTOR * 2.4) and night < rush and friday < rush
+    r = ex("travel_estimate", from_place="خانه", to_place="شرکت", arrive_by="2026-10-19 09:00")
+    assert r["traffic_source"] == "default" and r["leave_at"] == "2026-10-19 08:12"
+
+
+def test_reported_trips_teach_the_traffic_model(clock):
+    ex("set_place", name="خانه", kind="home")
+    ex("set_place", name="شرکت", kind="work")
+    ex("set_travel_time", from_place="خانه", to_place="شرکت", minutes=46, mode="car")
+    for day in (19, 20):  # two mornings it took 70 minutes
+        ex("set_travel_time", from_place="خانه", to_place="شرکت", minutes=70, observed=True,
+           when=f"2026-10-{day} 08:10")
+    r = ex("travel_estimate", from_place="خانه", to_place="شرکت", at="2026-10-21 08:30")
+    assert r["traffic_source"] == "learned" and r["minutes"] == 70
+    r = ex("travel_estimate", from_place="خانه", to_place="شرکت", at="2026-10-21 17:00")
+    assert r["traffic_source"] == "calibrated" and r["minutes"] > round(46 / 2.3 * 2.6)  # evening scaled up too
+    with session() as s:
+        assert places.resolve(s, "شرکت") and s.query(Place).count() == 2
+        from app.db import TravelTime
+
+        assert {x.minutes for x in s.query(TravelTime).all()} == {46}  # the usual time stays what the user said
+
+
+def test_set_place_with_map_link_measures_routes(monkeypatch):
+    from app import routing
+
+    async def fake_route(a, b, mode=""):
+        return {"minutes": 16.0, "km": 13.0}
+
+    monkeypatch.setattr(routing, "route", fake_route)
+    ex("set_place", name="خانه", kind="home", location="35.7036,51.3519")
+    r = ex("set_place", name="شرکت", kind="work", location="https://www.google.com/maps/place/x/@35.7575,51.4215,17z")
+    assert r["routes_measured"] == 1 and r["place"]["lat"] == 35.7575
+    with session() as s:
+        rows = places.travel_rows(s)
+    assert rows[0]["estimated"] and rows[0]["minutes"] == round(16 * 2.3) and rows[0]["distance_km"] == 13.0
+    # a user statement replaces the map estimate as the usual time
+    ex("set_travel_time", from_place="خانه", to_place="شرکت", minutes=45, mode="taxi")
+    with session() as s:
+        assert places.travel_rows(s)[0]["minutes"] == 45 and not places.travel_rows(s)[0]["estimated"]
+
+
+def test_coordinates_from_links_and_text():
+    from app import routing
+
+    assert routing.parse_coords("https://www.google.com/maps/@35.70,51.35,15z") == (35.70, 51.35)
+    assert routing.parse_coords("https://maps.google.com/?q=35.7%2C51.4") == (35.7, 51.4)
+    assert routing.parse_coords("https://balad.ir/location?lat=35.75&lng=51.42") == (35.75, 51.42)
+    assert routing.parse_coords("۳۵.۷۰۳۶، ۵۱.۳۵۱۹") == (35.7036, 51.3519)
+    assert routing.parse_coords("خیابان آزادی") is None
+
+
+def test_telegram_location_pin_reaches_the_agent(monkeypatch, fake_llm):
+    bot = telegram.TelegramBot("TOKEN", "https://api.telegram.org")
+    seen = []
+
+    async def fake_reply(chat_id, text, attachments, meta):
+        seen.append(text)
+
+    monkeypatch.setattr(bot, "reply", fake_reply)
+    prefs.set("telegram_chat_id", 42)
+    run(bot.handle({"message": {"chat": {"id": 42}, "caption": "اینجا شرکته",
+                                "location": {"latitude": 35.7575, "longitude": 51.4215}}}))
+    assert "اینجا شرکته" in seen[0] and "35.757500,51.421500" in seen[0]

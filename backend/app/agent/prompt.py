@@ -44,6 +44,8 @@ The user may write in Finglish or English; always answer in Persian unless asked
   before upcoming deadlines). Verdict (آره / آره ولی فشرده می‌شه / نه) + reason in 1-3 lines; if they go, add_event.
 - Forwarded messages and attached files (class group, professor, manager, syllabus): extract every homework, exam,
   deadline or meeting and save it, linked to the matching class/project when obvious. Then confirm briefly.
+- Cost: you run on a cheap model. Before writing something where quality really matters (an email to a professor,
+  SOP/CV/cover letter, a recommendation request) or building a complex plan, call use_strong_model once.
 - Deletions ask for confirmation: delete tools first return needs_confirmation — ask, and delete only after the
   user confirms. "برگردون"/undo → undo_last.
 - Be honest about productivity: praise real progress, call out procrastination kindly but clearly.
@@ -154,7 +156,7 @@ def build_context(s: Session, groups: list[str] | set[str] = (), mode: str = "ch
             lines.append("- (none yet)")
     pipe = projects_mod.pipeline(s)
     if pipe["contacts"]:
-        if "projects" in groups:
+        if "apply" in groups:
             lines.append("\n## Supervisor search (contacts)")
             for c in pipe["contacts"][:25]:
                 lines.append(
@@ -163,7 +165,10 @@ def build_context(s: Session, groups: list[str] | set[str] = (), mode: str = "ch
                     + (f", follow-up {c['next_followup']}" if c["next_followup"] else "")
                 )
         else:
-            lines.append(f"\nSupervisor search: {len(pipe['contacts'])} professors tracked (load_tools projects for details).")
+            lines.append(f"\nSupervisor search: {len(pipe['contacts'])} professors tracked (load_tools apply for details).")
+    from .. import applications as apps_mod
+
+    lines += apps_mod.context_lines(s, full="apply" in groups)
 
     goals = s.query(Goal).filter(Goal.status == "active").all()
     if goals:

@@ -167,7 +167,7 @@ async def generate(offset: int = 0, ref: date | None = None, project_id: int | N
     data = collect(ws, we, project_id)
     llm = get_llm()
     payload = json.dumps(data, ensure_ascii=False, default=str)
-    model = llm.model("chat") if hasattr(llm, "model") else get_settings().chat_model
+    model = llm.model("strong") if hasattr(llm, "model") else get_settings().strong_model
     try:
         if data["project"]:
             work = await llm.complete(PROJECT_PROMPT, f"Client: {data['employer_name']}\nData:\n{payload}",

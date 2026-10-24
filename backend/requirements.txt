@@ -12,3 +12,5 @@ itsdangerous>=2.2
 numpy>=1.26
 pypdf>=4.0
 pywebpush>=2.0
+icalendar>=6.0
+recurring-ical-events>=3.3

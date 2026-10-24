@@ -90,6 +90,11 @@ TOOL_LABELS = {
     "add_contact": "🎓 استاد",
     "update_contact": "🎓 پیگیری استاد",
     "set_place": "📍 مکان",
+    "use_strong_model": "🧠 مدل قوی‌تر",
+    "add_application": "🎓 اپلای",
+    "update_application": "🎓 ویرایش اپلای",
+    "update_application_item": "☑️ چک‌لیست اپلای",
+    "create_email_draft": "✉️ پیش‌نویس در Gmail",
     "set_travel_time": "🚗 زمان مسیر",
 }
 STATUS_LABELS = {
@@ -102,7 +107,8 @@ STATUS_LABELS = {
 }
 READ_ONLY = {"get_agenda", "list_tasks", "list_recurring_events", "get_stats", "list_followups", "list_habits",
              "list_commitments", "ielts_progress", "vocab_due", "get_insights", "rescue_plan", "check_availability",
-             "list_projects", "list_contacts", "start_speaking_practice", "list_places", "load_tools"}
+             "list_projects", "list_contacts", "start_speaking_practice", "list_places", "load_tools",
+             "travel_estimate", "list_applications", "check_email", "use_strong_model"}
 
 # the reply says something was stored, although nothing was
 CLAIM_RE = re.compile(
@@ -114,6 +120,14 @@ VERIFY_NOTE = (
     "succeeded in this turn, so nothing was stored. Call the needed tools now (remember / add_project / add_task / "
     "add_event / ...) with correct arguments, then reply. If nothing needed saving, rewrite your reply without "
     "claiming that you saved anything."
+)
+
+# turns that deserve the stronger model from the start (the cheap one can also switch with use_strong_model)
+STRONG_RE = re.compile(
+    r"((ایمیل|email|mail|نامه)\S*\s.{0,40}(بنویس|بنویسی|draft|write|متن)|(بنویس|draft|write)\S*\s.{0,40}(ایمیل|email)|"
+    r"انگیزه ?‌?نامه|\bsop\b|statement of purpose|motivation letter|cover letter|رزومه|\bcv\b|توصیه ?‌?نامه|"
+    r"recommendation letter|برنامه (این |ی )?(هفته|هفتگی)|weekly plan)",
+    re.I,
 )
 
 DeltaCallback = Callable[[str], Awaitable[None]]
@@ -299,6 +313,13 @@ async def run_agent(
             session_id = sessions.current_id(s)
     ctx = tools.Ctx(channel=channel, turn_id=turn_id)
     ctx.groups.update(_turn_groups(session_id, query[:2000], attachments))
+    strong_model = llm.model("strong") if hasattr(llm, "model") else None
+    if model is None and STRONG_RE.search(query[:2000]):
+        ctx.strong = True
+
+    def pick() -> str | None:  # an explicit model (e.g. evals) always wins
+        return strong_model if model is None and ctx.strong and strong_model else model
+
     with session() as s:
         # static part first (identical on every call → cacheable), then everything that changes
         static = prompt.persona(s)
@@ -316,7 +337,7 @@ async def run_agent(
     try:
         for _ in range(MAX_STEPS):
             schemas = tools.schemas(toolsets.tool_names(ctx.groups))
-            res = await llm.chat(messages, tools=schemas, model=model, on_delta=stream)
+            res = await llm.chat(messages, tools=schemas, model=pick(), on_delta=stream)
             if not res.tool_calls:
                 reply = res.content.strip()
                 stored = any(a["ok"] and a["tool"] not in READ_ONLY for a in actions)
@@ -357,7 +378,7 @@ async def run_agent(
             if ctx.changed:
                 bus.publish("data_changed", sorted(ctx.changed))
         messages.append({"role": "user", "content": "[system] Stop calling tools now and reply to the user."})
-        res = await llm.chat(messages, model=model, on_delta=stream)
+        res = await llm.chat(messages, model=pick(), on_delta=stream)
         return res.content.strip(), actions, ctx.changed, sorted(ctx.groups)
     finally:
         tools.finalize(ctx)
@@ -521,7 +542,7 @@ async def handle_user_message(
             bus.publish("typing", False)
 
 
-async def compose(instruction: str, fallback: str) -> str:
+async def compose(instruction: str, fallback: str, strong: bool = False) -> str:
     """Write a proactive message (no tools) in the assistant's voice, with a slim context."""
     llm = get_llm()
     try:
@@ -544,7 +565,8 @@ async def compose(instruction: str, fallback: str) -> str:
                 "and specific, no preamble like 'سلام دوباره' every time, do not mention this trigger.]\n\n" + instruction,
             }
         )
-        res = await llm.chat(messages, model=llm.model("fast") if hasattr(llm, "model") else None, purpose="compose")
+        kind = "strong" if strong else "fast"
+        res = await llm.chat(messages, model=llm.model(kind) if hasattr(llm, "model") else None, purpose="compose")
         text = res.content.strip()
         return text or fallback
     except LLMError as e:

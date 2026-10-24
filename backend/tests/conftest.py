@@ -71,7 +71,8 @@ class FakeLLM:
         self.default = default
 
     def model(self, kind):
-        return {"chat": "fake-chat", "fast": "fake-fast", "vision": "fake-vision", "ielts": "fake-ielts"}[kind]
+        return {"chat": "fake-chat", "fast": "fake-fast", "vision": "fake-vision", "ielts": "fake-ielts",
+                "strong": "fake-strong"}[kind]
 
     def budget(self):
         return {"spent_today": 0.0, "limit": 0, "over": False}

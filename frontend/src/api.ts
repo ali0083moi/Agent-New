@@ -66,6 +66,8 @@ export type Place = {
   aliases: string[];
   kind: string;
   address: string;
+  lat: number | null;
+  lon: number | null;
   from_home_minutes: number | null;
 };
 
@@ -79,6 +81,8 @@ export type TravelRow = {
   mode: string;
   both_ways: boolean;
   samples: number;
+  estimated: boolean;
+  distance_km: number | null;
 };
 
 export type PlacesData = {
@@ -328,6 +332,7 @@ export type SettingsData = {
     fast_model: string;
     vision_model: string;
     ielts_model: string;
+    strong_model: string;
     transcribe_model: string;
     tts_model: string;
     embedding_model: string;

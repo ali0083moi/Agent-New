@@ -15,7 +15,7 @@ from dataclasses import dataclass
 CORE = [
     "get_agenda", "list_tasks", "add_task", "update_task", "complete_task", "delete_task",
     "add_event", "check_availability", "log_work", "start_focus", "stop_focus",
-    "remember", "schedule_followup", "undo_last", "load_tools",
+    "remember", "schedule_followup", "undo_last", "load_tools", "use_strong_model",
 ]
 
 
@@ -98,26 +98,41 @@ GROUPS: dict[str, Group] = {
     ),
     "places": Group(
         "places, travel times, getting-ready time",
-        ("set_place", "set_travel_time", "list_places", "update_preferences"),
+        ("set_place", "set_travel_time", "travel_estimate", "list_places", "update_preferences"),
         r"خونه|خانه|شرکت|محل کار|دانشگاه|آموزشگاه|باشگاه|مسیر|ترافیک|برسم|رسیدم|راه بیفت|طول (می ?‌?)?کشه|"
-        r"حاضر (شدن|بشم|میشم)|آماده (شدن|بشم)|رفت ?و ?آمد|فاصله|مترو|تاکسی|اسنپ|ماشین ?(خودم|شخصی)|travel|commute",
+        r"حاضر (شدن|بشم|میشم)|آماده (شدن|بشم)|رفت ?و ?آمد|فاصله|مترو|تاکسی|اسنپ|ماشین ?(خودم|شخصی)|travel|commute|"
+        r"موقعیت|لوکیشن|آدرس|نشان|بلد|maps\.|neshan|balad|ترافیک|کی راه بیفتم|کی برم",
         """- Places & travel: register the places the user goes to with set_place (home is kind=home) and the
   door-to-door travel time between them with set_travel_time (both ways unless they differ). When the user reports
-  how long a trip really took ("امروز ۵۰ دقیقه طول کشید برسم"), call set_travel_time with observed=true — it is
-  averaged with what was known. Getting-ready time before leaving home → update_preferences(prep_minutes).
+  how long a trip really took ("امروز ۵۰ دقیقه طول کشید برسم"), call set_travel_time with observed=true (and when
+  it started) — that teaches the traffic model for that time of day. If they give an address or a map link (or send
+  a location pin), pass it as set_place location=… so the route is measured on the map. "When should I leave / how
+  long at 5?" → travel_estimate. Getting-ready time before leaving home → update_preferences(prep_minutes).
   Classes/events whose location matches a place automatically get travel time in the plan and a "time to get
   ready / leave" reminder.""",
     ),
     "projects": Group(
-        "projects, professors / supervisor search",
-        ("add_project", "update_project", "list_projects", "add_contact", "update_contact", "list_contacts"),
-        r"پروژه|project|استاد|پروفسور|professor|prof\.?|dr\.?|اپلای|apply|ایمیل|email|سوپروایزر|supervisor|"
-        r"کارفرما|مشتری|client|دانشگاه .* (خارج|کانادا|آلمان|آمریکا)|ریسرچ|research|پوزیشن|position",
+        "projects with nicknames, clients",
+        ("add_project", "update_project", "list_projects"),
+        r"پروژه|project|کارفرما|مشتری|client",
         """- Projects: when the user mentions a new project, register it once with add_project including every nickname
-  ("tahami supercars" = «پروژه ماشین»), then link tasks and logged time with project="<name or nickname>".
-- Applying / supervisor search (پیدا کردن استاد): track each professor with add_contact (university, research field,
-  email). When the user says they emailed someone, update_contact(status="contacted") — a follow-up is then scheduled
-  automatically. Help draft tailored cold emails and follow-ups in English, and keep the pipeline moving.""",
+  ("tahami supercars" = «پروژه ماشین»), then link tasks and logged time with project="<name or nickname>".""",
+    ),
+    "apply": Group(
+        "applying: professors / supervisor search, university applications & checklists, Gmail drafts",
+        ("add_contact", "update_contact", "list_contacts", "add_application", "update_application",
+         "update_application_item", "list_applications", "create_email_draft", "check_email"),
+        r"استاد|پروفسور|professor|prof\.?|dr\.?|اپلای|apply|application|ایمیل|email|جیمیل|gmail|سوپروایزر|supervisor|"
+        r"ریسرچ|research|پوزیشن|position|پذیرش|admission|ددلاین اپلای|انگیزه ?‌?نامه|sop|توصیه ?‌?نامه|recommendation|"
+        r"رزومه|cv|ریزنمره|transcript|دانشگاه .* (خارج|کانادا|آلمان|آمریکا|انگلیس|استرالیا|ایتالیا|هلند|سوئد)|"
+        r"ارشد|دکتری|phd|msc|master",
+        """- Supervisor search: track each professor with add_contact (university, research field, email). When the user
+  emailed someone, update_contact(status="contacted") — a follow-up is then scheduled automatically. If Gmail is
+  connected, replies and sent emails are detected by themselves (check_email checks now).
+- Emails to professors/recommenders: write them in English, short and specific to the professor's research, and
+  save them with create_email_draft (the user sends them from Gmail). If Gmail isn't connected, show the text.
+- Applications: add_application per university/program (with deadline) → a checklist and deadline reminders are
+  created; tick items with update_application_item (all_applications=true for shared items like the CV).""",
     ),
 }
 
@@ -130,7 +145,9 @@ KIND_GROUPS = {
     "rescue": ("planning",),
     "habit_reminder": ("habits",),
     "vocab_review": ("ielts",),
-    "contact_followup": ("projects",),
+    "contact_followup": ("apply",),
+    "contact_reply": ("apply",),
+    "application_deadline": ("apply",),
     "block_start": ("planning",),
     "block_end": ("planning",),
     "weekly_report": ("reports",),

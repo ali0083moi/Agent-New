@@ -33,6 +33,7 @@ class Ctx:
     trusted: bool = False  # explicit action in the web UI (skips the delete confirmation)
     replan: bool = False
     groups: set[str] = field(default_factory=set)  # tool groups loaded for this turn (see toolsets)
+    strong: bool = False  # this turn runs on the stronger model (use_strong_model / routing in agent.core)
 
 
 # tools after which the plan doesn't need to be refreshed
@@ -735,6 +736,8 @@ def add_event(s: Session, ctx: Ctx, title: str, start: str, end: str | None = No
 )
 def update_event(s: Session, ctx: Ctx, event_id: int, **data):
     ev = _get(s, Event, event_id, "رویداد")
+    if ev.source == "gcal":
+        return {"error": "this event comes from the user's Google Calendar — it can only be changed there (it syncs back every 15 minutes)"}
     journal.before_update(s, ctx, ev, f"ویرایش «{ev.title}»")
     duration = ev.end_at - ev.start_at
     if "start" in data:
@@ -754,6 +757,8 @@ def update_event(s: Session, ctx: Ctx, event_id: int, **data):
       {"event_id": {"type": "integer"}, "confirmed": _CONFIRM}, ["event_id"], changes=("schedule",))
 def delete_event(s: Session, ctx: Ctx, event_id: int, confirmed: bool = False):
     ev = _get(s, Event, event_id, "رویداد")
+    if ev.source == "gcal":
+        return {"error": "this event comes from the user's Google Calendar — it can only be changed there (it syncs back every 15 minutes)"}
     guard = journal.confirm_guard(ctx, f"event:{ev.id}", f"رویداد «{ev.title}»", confirmed)
     if guard:
         return guard

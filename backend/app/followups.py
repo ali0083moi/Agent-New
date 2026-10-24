@@ -28,6 +28,7 @@ IDLE_MAX_PER_DAY = {"low": 1, "normal": 2, "high": 4}
 # how late a follow-up may still be sent before it is considered stale
 MAX_DELAY = {
     "leave": timedelta(minutes=20),
+    "application_deadline": timedelta(hours=20),
     "block_start": timedelta(minutes=30),
     "block_end": timedelta(hours=2),
     "post_class": timedelta(hours=14),
@@ -220,6 +221,11 @@ def generate(s: Session, now: datetime | None = None) -> int:
             if _ensure(s, f"rescue:{now.date().isoformat()}", "rescue", now, payload={"task_ids": ids}):
                 n += 1
 
+    # 9) university application deadlines
+    from . import applications
+
+    n += applications.ensure_followups(s, now)
+
     # 8) time to get ready / leave for appointments somewhere else (known place + travel time)
     if p.get("leave_reminders", True):
         n += _leave_reminders(s, now)
@@ -254,7 +260,7 @@ def _leave_reminders(s: Session, now: datetime) -> int:
             payload = {"title": it.title, "start": timeutil.iso(it.start), "place": it.place.name,
                        "leave_at": timeutil.iso(trip.leave_at), "travel": trip.before - (prep if trip.prep_from else 0),
                        "origin": trip.origin.name if trip.origin else "", "from_home": trip.prep_from is not None,
-                       "prep": prep if trip.prep_from else 0}
+                       "prep": prep if trip.prep_from else 0, "traffic": trip.traffic}
             if _ensure(s, f"leave:{it.place.id}:{timeutil.iso(it.start)}", "leave", due, payload=payload):
                 n += 1
     return n
@@ -364,6 +370,12 @@ def _still_valid(s: Session, f: Followup, now: datetime) -> bool:
     if f.kind == "contact_followup":
         c = s.get(Contact, f.contact_id) if f.contact_id else None
         if c is None or timeutil.iso(c.next_followup_at) != (f.payload or {}).get("next"):
+            return False
+    if f.kind == "application_deadline":
+        from .db import Application
+
+        a = s.get(Application, f.application_id) if f.application_id else None
+        if a is None or a.status not in ("researching", "preparing") or timeutil.iso(a.deadline) != (f.payload or {}).get("deadline"):
             return False
     if f.kind == "vocab_review" and not s.query(VocabWord.id).filter(VocabWord.due <= now.date()).first():
         return False

@@ -155,14 +155,14 @@ class LLM:
         return self._client
 
     def model(self, kind: str) -> str:
-        """Model for a role (chat|fast|vision|ielts); user overrides from Settings win over .env."""
+        """Model for a role (chat|fast|vision|ielts|strong); user overrides from Settings win over .env."""
         from . import prefs
 
         override = prefs.get(f"llm_{kind}_model") or ""
         if override:
             return override
         if kind == "ielts":
-            return self.settings.ielts_model or self.model("chat")
+            return self.settings.ielts_model or self.model("strong")
         return getattr(self.settings, f"{kind}_model")
 
     @staticmethod

@@ -3,6 +3,7 @@ import { Bell, Bot, Brain, CalendarRange, Copy, GraduationCap, Link2Off, Moon, S
 import { api, type Memory, type SettingsData, type Usage } from "../api";
 import { JalaliInput } from "../components/JalaliPicker";
 import { PlacesCard } from "../components/Places";
+import { CalendarCard, GmailCard } from "../components/Integrations";
 import { currentSubscription, disablePush, enablePush, pushSupported } from "../pwa";
 import { useData, useLive } from "../live";
 import { Badge, Button, Card, Input, Segmented, Select, Spinner, Toggle } from "../components/ui";
@@ -164,6 +165,8 @@ export default function Settings({ theme, setTheme }: { theme: string; setTheme:
       </Card>
 
       <PlacesCard />
+      <CalendarCard />
+      <GmailCard />
 
       <Card title="پیگیری‌ها" icon={<Zap className="size-4 text-amber-500" />}>
         <Row label="شدت پیگیری" hint="تعداد یادآوری‌ها و احوال‌پرسی‌ها">
@@ -243,6 +246,10 @@ export default function Settings({ theme, setTheme }: { theme: string; setTheme:
         <ModelRow label="مدل گفتگو و ابزارها" k="llm_chat_model" current={data.llm.chat_model} envDefault={data.llm.env_defaults.chat} save={save} />
         <ModelRow label="مدل سریع (پیام‌های خودکار)" k="llm_fast_model" current={data.llm.fast_model} envDefault={data.llm.env_defaults.fast} save={save} />
         <ModelRow label="مدل تصویر" k="llm_vision_model" current={data.llm.vision_model} envDefault={data.llm.env_defaults.vision} save={save} />
+        <ModelRow label="مدل قوی (کارهای مهم)" k="llm_strong_model" current={data.llm.strong_model} envDefault={data.llm.env_defaults.strong} save={save} />
+        <p className="pb-2 text-xs leading-6 text-slate-500 dark:text-slate-400">
+          فقط برای نوشتن ایمیل به استادها، انگیزه‌نامه و رزومه، برنامه هفتگی، گزارش هفتگی و تصحیح آیلتس استفاده می‌شود؛ بقیه کارها با مدل ارزان گفتگو انجام می‌شوند.
+        </p>
         <ModelRow label="مدل تصحیح آیلتس" k="llm_ielts_model" current={data.llm.ielts_model} envDefault={data.llm.env_defaults.ielts} save={save} />
         <Row label="صدا / embedding / جایگزین‌ها">
           <code className="ltr text-xs">

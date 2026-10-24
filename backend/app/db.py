@@ -107,6 +107,8 @@ class Event(Base):
     end_at: Mapped[datetime] = mapped_column(DateTime)
     location: Mapped[str] = mapped_column(String(200), default="")
     notes: Mapped[str] = mapped_column(Text, default="")
+    source: Mapped[str] = mapped_column(String(16), default="")  # "" = added here | gcal = imported calendar
+    external_id: Mapped[str | None] = mapped_column(String(300), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
 
@@ -133,6 +135,8 @@ class Place(Base):
     aliases: Mapped[list[str]] = mapped_column(JSON, default=list)
     kind: Mapped[str] = mapped_column(String(24), default="other")  # home | work | university | class | gym | other
     address: Mapped[str] = mapped_column(Text, default="")
+    lat: Mapped[float | None] = mapped_column(Float, nullable=True)
+    lon: Mapped[float | None] = mapped_column(Float, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
 
@@ -146,7 +150,55 @@ class TravelTime(Base):
     minutes: Mapped[int] = mapped_column(Integer)
     mode: Mapped[str] = mapped_column(String(24), default="")  # car | taxi | metro | bus | walk | bike
     samples: Mapped[int] = mapped_column(Integer, default=1)  # how many reports the value is averaged from
+    base_minutes: Mapped[float | None] = mapped_column(Float, nullable=True)  # traffic-free driving time (OSM routing)
+    distance_km: Mapped[float | None] = mapped_column(Float, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class TravelObservation(Base):
+    """A real trip the user reported ("it took 50 minutes today") — used to learn traffic by time of day."""
+
+    __tablename__ = "travel_observations"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    from_place_id: Mapped[int] = mapped_column(ForeignKey("places.id", ondelete="CASCADE"), index=True)
+    to_place_id: Mapped[int] = mapped_column(ForeignKey("places.id", ondelete="CASCADE"), index=True)
+    minutes: Mapped[int] = mapped_column(Integer)
+    mode: Mapped[str] = mapped_column(String(24), default="")
+    at: Mapped[datetime] = mapped_column(DateTime)  # when the trip started
+
+
+class Application(Base):
+    """A university / program the user applies to."""
+
+    __tablename__ = "applications"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    university: Mapped[str] = mapped_column(String(160))
+    program: Mapped[str] = mapped_column(String(160), default="")
+    country: Mapped[str] = mapped_column(String(60), default="")
+    degree: Mapped[str] = mapped_column(String(16), default="msc")  # msc | phd | other
+    deadline: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # researching | preparing | submitted | interview | admitted | rejected | waitlisted | withdrawn
+    status: Mapped[str] = mapped_column(String(16), default="preparing")
+    portal_url: Mapped[str] = mapped_column(String(400), default="")
+    fee: Mapped[str] = mapped_column(String(40), default="")
+    contact_id: Mapped[int | None] = mapped_column(ForeignKey("contacts.id", ondelete="SET NULL"), nullable=True)
+    notes: Mapped[str] = mapped_column(Text, default="")
+    submitted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class ApplicationItem(Base):
+    """One thing an application needs (SOP, CV, a recommendation letter...)."""
+
+    __tablename__ = "application_items"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    application_id: Mapped[int] = mapped_column(ForeignKey("applications.id", ondelete="CASCADE"), index=True)
+    kind: Mapped[str] = mapped_column(String(24), default="other")  # sop | cv | transcript | ielts | gre | recommendation | fee | portfolio | other
+    title: Mapped[str] = mapped_column(String(160))
+    status: Mapped[str] = mapped_column(String(16), default="todo")  # todo | in_progress | requested | done
+    person: Mapped[str] = mapped_column(String(160), default="")  # recommender
+    due: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    notes: Mapped[str] = mapped_column(Text, default="")
 
 
 class Contact(Base):
@@ -240,6 +292,7 @@ class Followup(Base):
     )
     block_id: Mapped[int | None] = mapped_column(ForeignKey("planned_blocks.id", ondelete="CASCADE"), nullable=True)
     contact_id: Mapped[int | None] = mapped_column(ForeignKey("contacts.id", ondelete="CASCADE"), nullable=True)
+    application_id: Mapped[int | None] = mapped_column(ForeignKey("applications.id", ondelete="CASCADE"), nullable=True)
     created_by: Mapped[str] = mapped_column(String(16), default="system")  # system|agent|snooze
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     sent_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

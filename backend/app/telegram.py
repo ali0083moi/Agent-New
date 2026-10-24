@@ -394,6 +394,11 @@ class TelegramBot:
             if cmd in COMMANDS:
                 text = COMMANDS[cmd]
 
+        loc = (msg.get("venue") or {}).get("location") or msg.get("location")
+        if loc:
+            title = (msg.get("venue") or {}).get("title") or ""
+            text = (text + "\n" if text else "") + (
+                f"[موقعیت مکانی فرستادم{f' ({title})' if title else ''}: {loc['latitude']:.6f},{loc['longitude']:.6f}]")
         meta: dict[str, Any] = {}
         fwd = _forward_label(msg)
         if fwd:

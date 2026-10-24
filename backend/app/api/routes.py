@@ -803,12 +803,13 @@ def get_settings_api():
             "fast_model": model("fast") if model else st.fast_model,
             "vision_model": model("vision") if model else st.vision_model,
             "ielts_model": model("ielts") if model else st.chat_model,
+            "strong_model": model("strong") if model else st.strong_model,
             "transcribe_model": st.transcribe_model,
             "tts_model": st.tts_model,
             "embedding_model": st.embedding_model,
             "fallback_models": st.fallback_models,
             "env_defaults": {"chat": st.chat_model, "fast": st.fast_model, "vision": st.vision_model,
-                             "ielts": st.ielts_model or st.chat_model},
+                             "ielts": st.ielts_model or st.strong_model, "strong": st.strong_model},
         },
         "budget": llm.budget() if hasattr(llm, "budget") else None,
         "push": {"subscriptions": push.count()},
@@ -871,6 +872,7 @@ class PlaceBody(BaseModel):
     kind: str | None = None
     aliases: list[str] | None = None
     address: str | None = None
+    location: str | None = None  # address, map link or "lat,lon" → coordinates + measured routes
 
 
 class TravelBody(BaseModel):
@@ -894,39 +896,34 @@ def list_places():
 
 
 @router.post("/places")
-def create_place(body: PlaceBody):
-    from .. import places
-    from ..db import Place
-
+async def create_place(body: PlaceBody):
     if not (body.name or "").strip():
         raise HTTPException(400, "اسم مکان لازم است")
-    with session() as s:
-        p = Place(name=body.name.strip(), kind=body.kind or "other", aliases=body.aliases or [], address=body.address or "")
-        s.add(p)
-        s.flush()
-        planner.invalidate(s)
-        data = places.place_dict(s, p)
-    bus.publish("data_changed", ["places", "schedule"])
-    return data
+    args = {"name": body.name.strip(), "kind": body.kind or "other", "aliases": body.aliases or []}
+    if (body.location or "").strip():
+        args["location"] = body.location.strip()
+    return await _tool("set_place", args)
 
 
 @router.patch("/places/{place_id}")
-def update_place(place_id: int, body: PlaceBody):
-    from .. import places
+async def update_place(place_id: int, body: PlaceBody):
     from ..db import Place
 
     with session() as s:
         p = s.get(Place, place_id)
         if p is None:
             raise HTTPException(404, "مکان پیدا نشد")
-        for key in ("name", "kind", "aliases", "address"):
-            v = getattr(body, key)
-            if v is not None:
-                setattr(p, key, v.strip() if isinstance(v, str) else v)
-        planner.invalidate(s)
-        data = places.place_dict(s, p)
-    bus.publish("data_changed", ["places", "schedule"])
-    return data
+        if body.name is not None and body.name.strip():
+            p.name = body.name.strip()
+        if body.aliases is not None:
+            p.aliases = body.aliases
+        name = p.name
+    args: dict[str, Any] = {"name": name}
+    if body.kind:
+        args["kind"] = body.kind
+    if (body.location or "").strip():
+        args["location"] = body.location.strip()
+    return await _tool("set_place", args)
 
 
 @router.delete("/places/{place_id}")
@@ -970,4 +967,176 @@ def delete_travel(travel_id: int):
             s.delete(r)
         planner.invalidate(s)
     bus.publish("data_changed", ["places", "schedule"])
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------- Google Calendar (iCal links)
+class CalendarBody(BaseModel):
+    import_urls: list[str] | None = None
+    include: list[str] | None = None
+
+
+def _mask(url: str) -> str:
+    return url[:40] + "…" + url[-6:] if len(url) > 50 else url
+
+
+@router.get("/calendar")
+def calendar_settings():
+    from .. import calsync
+
+    with session() as s:
+        return {
+            "import_urls": [_mask(u) for u in prefs.get("gcal_ics_urls", s=s) or []],
+            "last_sync": prefs.get("gcal_last_sync", s=s),
+            "export_path": f"/cal/{calsync.token(s)}.ics",
+            "include": prefs.get("ics_include", s=s),
+            "parts": list(calsync.EXPORT_PARTS),
+        }
+
+
+@router.put("/calendar")
+async def calendar_update(body: CalendarBody):
+    from .. import calsync
+
+    if body.import_urls is not None:
+        urls = [u.strip() for u in body.import_urls if u.strip()]
+        bad = [u for u in urls if not u.startswith(("https://", "http://", "webcal://"))]
+        if bad:
+            raise HTTPException(400, "لینک باید با https:// یا webcal:// شروع شود")
+        prefs.set("gcal_ics_urls", urls)
+    if body.include is not None:
+        prefs.set("ics_include", [x for x in body.include if x in calsync.EXPORT_PARTS])
+    status = await calsync.sync() if body.import_urls is not None else None
+    return {"settings": calendar_settings(), "sync": status}
+
+
+@router.post("/calendar/sync")
+async def calendar_sync_now():
+    from .. import calsync
+
+    return await calsync.sync()
+
+
+@router.post("/calendar/token")
+def calendar_new_token():
+    from .. import calsync
+
+    with session() as s:
+        calsync.token(s, regenerate=True)
+    return calendar_settings()
+
+
+# ---------------------------------------------------------------- Gmail (IMAP + App Password)
+class MailBody(BaseModel):
+    address: str | None = None
+    app_password: str | None = None
+
+
+@router.get("/mail")
+def mail_settings():
+    from .. import mail
+
+    creds = mail.credentials()
+    return {"connected": creds is not None, "address": creds[0] if creds else "",
+            "state": {k: v for k, v in (prefs.get("mail_state") or {}).items() if k in ("last_check", "error", "initialized")}}
+
+
+@router.put("/mail")
+async def mail_connect(body: MailBody):
+    from .. import mail
+
+    if not body.address or not body.app_password:
+        prefs.set("gmail_address", None)
+        prefs.set("gmail_app_password", None)
+        prefs.set("mail_state", None)
+        return mail_settings()
+    try:
+        await mail.test(body.address.strip(), body.app_password)
+    except mail.MailError as e:
+        raise HTTPException(400, str(e)) from e
+    prefs.set("gmail_address", body.address.strip())
+    prefs.set("gmail_app_password", body.app_password.replace(" ", ""))
+    prefs.set("mail_state", None)
+    res = await mail.check()
+    return {**mail_settings(), "check": res}
+
+
+@router.post("/mail/check")
+async def mail_check_now():
+    from .. import mail
+
+    return await mail.check()
+
+
+# ---------------------------------------------------------------- university applications
+class ApplicationBody(BaseModel):
+    university: str | None = None
+    program: str | None = None
+    country: str | None = None
+    degree: str | None = None
+    deadline: str | None = None
+    status: str | None = None
+    portal_url: str | None = None
+    fee: str | None = None
+    notes: str | None = None
+    recommendations: int | None = None
+
+
+class ApplicationItemBody(BaseModel):
+    status: str | None = None
+    person: str | None = None
+    title: str | None = None
+
+
+@router.get("/applications")
+def list_applications_api():
+    from .. import applications
+    from ..db import Application
+
+    with session() as s:
+        rows = s.query(Application).order_by(Application.deadline.is_(None), Application.deadline).all()
+        return {"applications": [applications.app_dict(s, a) for a in rows], "status_fa": applications.STATUS_FA}
+
+
+@router.post("/applications")
+async def create_application(body: ApplicationBody):
+    args = {k: v for k, v in body.model_dump().items() if v not in (None, "")}
+    return await _tool("add_application", args)
+
+
+@router.patch("/applications/{app_id}")
+async def update_application_api(app_id: int, body: ApplicationBody):
+    args = {k: v for k, v in body.model_dump().items() if v not in (None, "") and k not in ("university", "recommendations")}
+    return await _tool("update_application", {"application": str(app_id), **args})
+
+
+@router.patch("/applications/{app_id}/items/{item_id}")
+def update_application_item_api(app_id: int, item_id: int, body: ApplicationItemBody):
+    from .. import applications
+    from ..db import ApplicationItem
+
+    with session() as s:
+        it = s.get(ApplicationItem, item_id)
+        if it is None or it.application_id != app_id:
+            raise HTTPException(404, "مورد پیدا نشد")
+        if body.status in applications.ITEM_STATUS:
+            it.status = body.status
+        if body.person is not None:
+            it.person = body.person
+        if body.title:
+            it.title = body.title
+        data = applications.item_dict(it)
+    bus.publish("data_changed", ["applications"])
+    return data
+
+
+@router.delete("/applications/{app_id}")
+def delete_application(app_id: int):
+    from ..db import Application
+
+    with session() as s:
+        a = s.get(Application, app_id)
+        if a is not None:
+            s.delete(a)
+    bus.publish("data_changed", ["applications", "followups"])
     return {"ok": True}

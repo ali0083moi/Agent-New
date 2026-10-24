@@ -631,50 +631,66 @@ from ..db import Place  # noqa: E402
 @tool(
     "set_place",
     "Add or update a place the user goes to (home, company, university, language school, gym…) with every "
-    "nickname they use. Locations of classes/events are matched to places by name or nickname.",
+    "nickname they use. location = its address, a map link (Google Maps/Neshan/Balad) or 'lat,lon' — then the "
+    "route to the other places is measured on the map. Locations of classes/events are matched to places by name.",
     {"name": {"type": "string"},
      "kind": {"type": "string", "enum": list(places_mod.KIND_FA)},
      "aliases": {"type": "array", "items": {"type": "string"}, "description": "nicknames, e.g. ['شرکت', 'دفتر']"},
-     "address": {"type": "string"}},
+     "location": {"type": "string", "description": "address, map link or 'lat,lon'"}},
     ["name"],
     changes=("places", "schedule"),
 )
-def set_place(s: Session, ctx: Ctx, name: str, kind: str | None = None, aliases: list[str] | None = None,
-              address: str | None = None):
-    p = places_mod.resolve(s, name)
-    if p is None:
-        p = Place(name=name.strip(), kind=kind or "other", aliases=[], address=address or "")
-        s.add(p)
+async def set_place(ctx: Ctx, name: str, kind: str | None = None, aliases: list[str] | None = None,
+                    location: str | None = None):
+    from .. import routing
+
+    found = await routing.locate(location) if location else None
+    with session() as s:
+        p = places_mod.resolve(s, name)
+        if p is None:
+            p = Place(name=name.strip(), kind=kind or "other", aliases=[], address="")
+            s.add(p)
+            s.flush()
+            journal.created(s, ctx, p, f"مکان «{p.name}»")
+        else:
+            journal.before_update(s, ctx, p, f"مکان «{p.name}»")
+        if kind:
+            p.kind = kind
+        if aliases:
+            known = {places_mod.norm(a) for a in [p.name, *(p.aliases or [])]}
+            p.aliases = [*(p.aliases or []), *[a for a in aliases if places_mod.norm(a) not in known]]
+        if location:
+            p.address = location if not found or not found[2] else found[2]
+        if found:
+            p.lat, p.lon = found[0], found[1]
         s.flush()
-        journal.created(s, ctx, p, f"مکان «{p.name}»")
-    else:
-        journal.before_update(s, ctx, p, f"مکان «{p.name}»")
-    if kind:
-        p.kind = kind
-    if address is not None:
-        p.address = address
-    if aliases:
-        known = {places_mod.norm(a) for a in [p.name, *(p.aliases or [])]}
-        p.aliases = [*(p.aliases or []), *[a for a in aliases if places_mod.norm(a) not in known]]
-    s.flush()
-    planner.invalidate(s)
-    return {"place": places_mod.place_dict(s, p)}
+        pid = p.id
+        planner.invalidate(s)
+    routes = await places_mod.fill_routes(pid) if found else 0
+    with session() as s:
+        out: dict[str, Any] = {"place": places_mod.place_dict(s, s.get(Place, pid))}
+    if location and not found:
+        out["warning"] = "couldn't find that location on the map — ask for a map link or a more exact address"
+    if routes:
+        out["routes_measured"] = routes
+    return out
 
 
 @tool(
     "set_travel_time",
-    "Door-to-door travel time between two places (by name or nickname). observed=true when the user reports how "
-    "long a real trip took (blended into the average) instead of their usual estimate.",
+    "Door-to-door travel time between two places (by name or nickname). The usual time by default; observed=true "
+    "when the user reports how long a real trip took (with `when` it started if not just now) — used to learn traffic.",
     {"from_place": {"type": "string"}, "to_place": {"type": "string"},
      "minutes": {"type": "integer"},
      "mode": {"type": "string", "description": "car | taxi | metro | bus | walk | bike"},
      "both_ways": {"type": "boolean", "description": "default true"},
-     "observed": {"type": "boolean"}},
+     "observed": {"type": "boolean"},
+     "when": {"type": "string", "description": "observed trips: when it started, " + DT_HELP}},
     ["from_place", "to_place", "minutes"],
     changes=("places", "schedule"),
 )
 def set_travel_time(s: Session, ctx: Ctx, from_place: str, to_place: str, minutes: int, mode: str = "",
-                    both_ways: bool = True, observed: bool = False):
+                    both_ways: bool = True, observed: bool = False, when: str | None = None):
     a, b = places_mod.resolve(s, from_place), places_mod.resolve(s, to_place)
     missing = [n for n, p in ((from_place, a), (to_place, b)) if p is None]
     if missing:
@@ -682,11 +698,40 @@ def set_travel_time(s: Session, ctx: Ctx, from_place: str, to_place: str, minute
                 "known": [p.name for p in s.query(Place).all()]}
     if a.id == b.id:
         return {"error": "from_place and to_place are the same place"}
-    row = places_mod.set_travel(s, a, b, int(minutes), mode, both_ways, observed)
+    at = timeutil.parse_datetime(when) if when else None
+    row = places_mod.set_travel(s, a, b, int(minutes), mode, both_ways, observed, at)
     planner.invalidate(s)
     ctx.replan = True
-    return {"travel": {"from": a.name, "to": b.name, "minutes": row.minutes, "mode": row.mode,
-                       "both_ways": both_ways, "averaged_from": row.samples}}
+    return {"travel": {"from": a.name, "to": b.name, "usual_minutes": row.minutes, "mode": row.mode,
+                       "both_ways": both_ways, "logged_trip": bool(observed)}}
+
+
+@tool(
+    "travel_estimate",
+    "How long a trip takes at a given time (car/taxi trips follow the traffic of that hour, learned from the "
+    "user's own trips). Use for 'how long to get to X at 5pm?' or 'when should I leave?'.",
+    {"from_place": {"type": "string"}, "to_place": {"type": "string"},
+     "at": {"type": "string", "description": "departure time, " + DT_HELP + " (default now)"},
+     "arrive_by": {"type": "string", "description": "or: when they must arrive (returns the leave time)"}},
+    ["from_place", "to_place"],
+)
+def travel_estimate(s: Session, ctx: Ctx, from_place: str, to_place: str, at: str | None = None,
+                    arrive_by: str | None = None):
+    a, b = places_mod.resolve(s, from_place), places_mod.resolve(s, to_place)
+    if a is None or b is None:
+        return {"error": "unknown place", "known": [p.name for p in s.query(Place).all()]}
+    if arrive_by:
+        arrive = timeutil.parse_datetime(arrive_by)
+        guess = arrive
+        for _ in range(3):  # the trip time depends on when you leave
+            est = places_mod.estimate(s, a, b, guess)
+            if est is None:
+                return {"error": f"no travel time known between {a.name} and {b.name} — ask the user"}
+            guess = arrive - timedelta(minutes=est["minutes"])
+        est["leave_at"] = timeutil.iso(guess)
+        return est
+    est = places_mod.estimate(s, a, b, timeutil.parse_datetime(at) if at else timeutil.now())
+    return est or {"error": f"no travel time known between {a.name} and {b.name} — ask the user"}
 
 
 @tool("list_places", "Known places, travel times between them and the getting-ready time.", {})
@@ -694,3 +739,181 @@ def list_places(s: Session, ctx: Ctx):
     prep, known = places_mod.prep_minutes(s)
     return {"places": [places_mod.place_dict(s, p) for p in s.query(Place).order_by(Place.id)],
             "travel": places_mod.travel_rows(s), "prep_minutes": prep, "prep_known": known}
+
+
+# ------------------------------------------------------------------ university applications
+from .. import applications as apps_mod  # noqa: E402
+from ..db import Application, ApplicationItem  # noqa: E402
+
+
+@tool(
+    "add_application",
+    "Track a university/program the user applies to. A checklist (SOP, CV, transcripts, IELTS, recommendation "
+    "letters, fee) is created and deadline reminders are automatic. Link the professor with contact=<name>.",
+    {"university": {"type": "string"}, "program": {"type": "string"}, "country": {"type": "string"},
+     "degree": {"type": "string", "enum": ["msc", "phd", "other"]},
+     "deadline": {"type": "string", "description": DT_HELP},
+     "recommendations": {"type": "integer", "description": "letters needed (default 2)"},
+     "portal_url": {"type": "string"}, "fee": {"type": "string"},
+     "status": {"type": "string", "enum": apps_mod.STATUS},
+     "contact": {"type": "string", "description": "professor (contact) name"},
+     "notes": {"type": "string"}},
+    ["university"],
+    changes=("applications", "followups"),
+)
+def add_application(s: Session, ctx: Ctx, university: str, program: str = "", country: str = "", degree: str = "msc",
+                    deadline: str | None = None, recommendations: int = 2, portal_url: str = "", fee: str = "",
+                    status: str = "preparing", contact: str | None = None, notes: str = ""):
+    existing = apps_mod.resolve(s, f"{university} {program}".strip())
+    if existing is not None and (not program or existing.program == program):
+        return {"error": "this application already exists — use update_application", "application": apps_mod.app_dict(s, existing)}
+    c = projects_mod.resolve_contact(s, contact) if contact else None
+    a = Application(university=university.strip(), program=program, country=country, degree=degree,
+                    deadline=timeutil.parse_datetime(deadline, default_time=timeutil.parse_time("23:59")) if deadline else None,
+                    status=status, portal_url=portal_url, fee=fee, notes=notes, contact_id=c.id if c else None)
+    s.add(a)
+    s.flush()
+    for kind, title in apps_mod.default_items(int(recommendations)):
+        s.add(ApplicationItem(application_id=a.id, kind=kind, title=title))
+    s.flush()
+    journal.created(s, ctx, a, f"اپلای «{apps_mod.a_label(a)}»")
+    out = {"application": apps_mod.app_dict(s, a)}
+    if contact and c is None:
+        out["warning"] = f"contact '{contact}' not found — add them with add_contact"
+    return out
+
+
+@tool(
+    "update_application",
+    "Update an application (by university name or id): status, deadline, program, portal, notes…",
+    {"application": {"type": "string"}, "status": {"type": "string", "enum": apps_mod.STATUS},
+     "deadline": {"type": "string", "description": DT_HELP}, "program": {"type": "string"},
+     "country": {"type": "string"}, "portal_url": {"type": "string"}, "fee": {"type": "string"},
+     "contact": {"type": "string"}, "add_note": {"type": "string"},
+     "add_item": {"type": "string", "description": "add a checklist item, e.g. 'نمونه کار'"}},
+    ["application"],
+    changes=("applications", "followups"),
+)
+def update_application(s: Session, ctx: Ctx, application: str, **data):
+    a = apps_mod.resolve(s, application)
+    if a is None:
+        return {"error": f"application '{application}' not found", "known": [apps_mod.a_label(x) for x in s.query(Application)]}
+    journal.before_update(s, ctx, a, f"اپلای «{apps_mod.a_label(a)}»")
+    for key in ("program", "country", "portal_url", "fee"):
+        if key in data:
+            setattr(a, key, data[key])
+    if data.get("status"):
+        a.status = data["status"]
+        if a.status == "submitted" and a.submitted_at is None:
+            a.submitted_at = timeutil.now()
+    if data.get("deadline"):
+        a.deadline = timeutil.parse_datetime(data["deadline"], default_time=timeutil.parse_time("23:59"))
+    if data.get("contact"):
+        c = projects_mod.resolve_contact(s, data["contact"])
+        a.contact_id = c.id if c else a.contact_id
+    if data.get("add_note"):
+        a.notes = (a.notes + "\n" if a.notes else "") + f"[{timeutil.jalali_str(timeutil.now())}] {data['add_note']}"
+    if data.get("add_item"):
+        s.add(ApplicationItem(application_id=a.id, kind="other", title=data["add_item"]))
+    s.flush()
+    return {"application": apps_mod.app_dict(s, a)}
+
+
+@tool(
+    "update_application_item",
+    "Tick off / update one checklist item of an application: e.g. SOP in_progress, recommendation requested from "
+    "Dr. X, transcripts done. item = its title or kind (sop, cv, transcript, ielts, recommendation, fee…).",
+    {"application": {"type": "string"}, "item": {"type": "string"},
+     "status": {"type": "string", "enum": apps_mod.ITEM_STATUS},
+     "person": {"type": "string", "description": "recommender's name"},
+     "due": {"type": "string", "description": DT_HELP}, "notes": {"type": "string"},
+     "all_applications": {"type": "boolean", "description": "apply to this item in every active application (e.g. CV done)"}},
+    ["application", "item"],
+    changes=("applications",),
+)
+def update_application_item(s: Session, ctx: Ctx, application: str, item: str, status: str | None = None,
+                            person: str | None = None, due: str | None = None, notes: str | None = None,
+                            all_applications: bool = False):
+    a = apps_mod.resolve(s, application)
+    if a is None:
+        return {"error": f"application '{application}' not found"}
+    targets = [a]
+    if all_applications:
+        targets = s.query(Application).filter(Application.status.in_(apps_mod.ACTIVE)).all()
+    changed = []
+    for app in targets:
+        it = apps_mod.resolve_item(s, app, item)
+        if it is None:
+            continue
+        journal.before_update(s, ctx, it, f"«{it.title}» در اپلای {app.university}")
+        if status:
+            it.status = status
+        if person is not None:
+            it.person = person
+        if due:
+            it.due = timeutil.parse_datetime(due)
+        if notes:
+            it.notes = notes
+        changed.append({"application": apps_mod.a_label(app), **apps_mod.item_dict(it)})
+    if not changed:
+        return {"error": f"item '{item}' not found", "items": [i.title for i in s.query(ApplicationItem).filter(ApplicationItem.application_id == a.id)]}
+    s.flush()
+    return {"updated": changed}
+
+
+@tool("list_applications", "All university applications with deadlines, status and checklists.",
+      {"active_only": {"type": "boolean"}})
+def list_applications(s: Session, ctx: Ctx, active_only: bool = False):
+    q = s.query(Application)
+    if active_only:
+        q = q.filter(Application.status.in_(apps_mod.ACTIVE))
+    return {"applications": [apps_mod.app_dict(s, a) for a in q.order_by(Application.deadline.is_(None), Application.deadline)]}
+
+
+# ------------------------------------------------------------------ Gmail
+from .. import mail as mail_mod  # noqa: E402
+
+
+@tool(
+    "create_email_draft",
+    "Save an email as a draft in the user's Gmail Drafts (they review and send it themselves). Use for cold emails "
+    "and follow-ups to professors, recommendation requests, etc. Write it in English unless asked otherwise.",
+    {"to": {"type": "string", "description": "contact name or email address"},
+     "subject": {"type": "string"}, "body": {"type": "string"}, "cc": {"type": "string"}},
+    ["to", "subject", "body"],
+)
+async def create_email_draft(ctx: Ctx, to: str, subject: str, body: str, cc: str = ""):
+    if mail_mod.credentials() is None:
+        return {"error": "Gmail is not connected (Settings → Gmail). Show the email text to the user instead."}
+    address = to.strip()
+    if "@" not in address:
+        with session() as s:
+            c = projects_mod.resolve_contact(s, to)
+            address = c.email if c and c.email else ""
+        if not address:
+            return {"error": f"no email address for '{to}' — ask the user for it (and save it with update_contact)"}
+    try:
+        box = await mail_mod.save_draft(address, subject, body, cc)
+    except mail_mod.MailError as e:
+        return {"error": str(e)}
+    return {"saved_to": box, "to": address, "subject": subject}
+
+
+@tool("check_email", "Check Gmail now for replies from / emails to the professors in the contacts.", {},
+      changes=("contacts", "followups"))
+async def check_email(ctx: Ctx):
+    return await mail_mod.check()
+
+
+# ------------------------------------------------------------------ model routing
+@tool(
+    "use_strong_model",
+    "Switch the rest of this turn to the stronger (more expensive) model. Only for work where quality really matters: "
+    "writing/reviewing emails to professors, SOP/CV/cover letters, recommendation requests, a complex weekly plan "
+    "or rescue plan, careful reasoning about a hard trade-off. Not for normal chat or simple saving.",
+    {"reason": {"type": "string"}},
+    ["reason"],
+)
+def use_strong_model(s: Session, ctx: Ctx, reason: str):
+    ctx.strong = True
+    return {"ok": True, "note": "the next steps of this turn run on the stronger model"}

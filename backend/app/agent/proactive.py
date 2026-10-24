@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import timedelta
 from typing import Any
@@ -248,28 +249,62 @@ def build(f: Followup) -> tuple[str, str, list[str]] | None:
             if c.status == "to_contact":
                 instr = (f"Supervisor search: it's time to email {c.name} ({c.organization}, {c.field}). Remind the user and "
                          "offer to draft a tailored cold email in English (short, specific to their research). "
-                         f"Contact: {d}")
+                         f"Contact: {json.dumps(d, ensure_ascii=False, default=str)}")
                 fallback = f"🎓 قرار بود به {c.name} ({c.organization}) ایمیل بزنی. متن ایمیل رو برات بنویسم؟"
                 return instr, fallback, ["متن ایمیل رو بنویس", "فرستادم ✅", "بعداً"]
             instr = (f"Supervisor search follow-up: {d['days_since_contact']} days since the user emailed {c.name} "
                      f"({c.organization}) and no reply is recorded. Ask if they got a reply; if not, offer to draft a "
                      "short polite follow-up email in English (reference the first email, add one new detail). "
-                     f"When the user answers, update the contact with update_contact. Contact: {d}")
+                     f"When the user answers, update the contact with update_contact. Contact: {json.dumps(d, ensure_ascii=False, default=str)}")
             fallback = (f"🎓 {timeutil.fa_digits(d['days_since_contact'] or 0)} روز از ایمیلت به {c.name} گذشته. "
                         "جواب داده؟ اگه نه، یه ایمیل پیگیری کوتاه برات بنویسم؟")
             return instr, fallback, ["جواب داده", "متن پیگیری رو بنویس", "بیخیالش"]
+
+        if f.kind == "application_deadline":
+            from .. import applications
+            from ..db import Application
+
+            a = s.get(Application, f.application_id) if f.application_id else None
+            if a is None:
+                return None
+            d = applications.app_dict(s, a)
+            days = (f.payload or {}).get("days")
+            instr = (f"University application deadline in {days} day(s): {applications.a_label(a)} ({a.country}), deadline "
+                     f"{d['deadline']}. Checklist {d['done']}/{d['total']}; still missing: {'، '.join(d['missing']) or 'nothing'}. "
+                     "Remind the user, say what to do today to make it (be concrete: which item first), and offer help "
+                     "(e.g. review the SOP, draft a reminder to a recommender). If everything is done, tell them to submit.")
+            missing = "، ".join(d["missing"][:4]) or "همه چیز آماده است"
+            fallback = (f"🎓 {timeutil.fa_digits(days)} روز تا ددلاین اپلای **{applications.a_label(a)}** مانده. "
+                        f"باقی‌مانده: {missing}")
+            return instr, fallback, ["کمکم کن", "ارسالش کردم ✅"]
+
+        if f.kind == "contact_reply":
+            from ..db import Contact
+
+            c = s.get(Contact, f.contact_id) if f.contact_id else None
+            if c is None:
+                return None
+            pl = f.payload or {}
+            instr = (f"Supervisor search: {c.name} ({c.organization}) just replied to the user's email (subject: "
+                     f"«{pl.get('subject', '')}», {pl.get('date', '')}). Their email:\n---\n{pl.get('text', '')[:2000]}\n---\n"
+                     "Tell the user in Persian, in 2-4 lines, what the professor said (positive? asks for CV/a call/"
+                     "interview? no position?) and the best next step. Offer to draft the reply in English. "
+                     "(The contact status is already 'replied'.)")
+            fallback = f"📩 {c.name} جواب ایمیلت رو داد: «{pl.get('subject', '')}». بخونمش و جوابشو برات بنویسم؟"
+            return instr, fallback, ["جوابشو بنویس", "بعداً می‌خونم"]
 
         if f.kind == "leave":
             pl = f.payload or {}
             start = timeutil.parse_datetime(pl["start"])
             leave = timeutil.parse_datetime(pl["leave_at"])
             hm = lambda d: timeutil.fa_digits(d.strftime("%H:%M"))  # noqa: E731
+            trip = f"مسیر حدود {timeutil.fa_digits(pl['travel'])} دقیقه" + (" با ترافیک معمول این ساعت" if pl.get("traffic") else "")
             if pl.get("from_home"):
                 text = (f"🚪 وقت حاضر شدنه: **{pl['title']}** ساعت {hm(start)} در «{pl['place']}».\n"
-                        f"ساعت {hm(leave)} باید از خونه راه بیفتی (مسیر حدود {timeutil.fa_digits(pl['travel'])} دقیقه).")
+                        f"ساعت {hm(leave)} باید از خونه راه بیفتی ({trip}).")
             else:
                 text = (f"🚗 ساعت {hm(leave)} از «{pl['origin']}» راه بیفت تا به **{pl['title']}** "
-                        f"(ساعت {hm(start)} در «{pl['place']}») برسی — مسیر حدود {timeutil.fa_digits(pl['travel'])} دقیقه.")
+                        f"(ساعت {hm(start)} در «{pl['place']}») برسی — {trip}.")
             return "", text, ["راه افتادم", "امروز نمی‌رم"]
 
         if f.kind == "custom":
@@ -302,7 +337,7 @@ async def dispatch(fid: int) -> dict[str, Any] | None:
     instr, fallback, quick = built
     async with core.lock:
         # an empty instruction means the fixed text is the message (no model call needed)
-        text = await core.compose(instr, fallback) if instr else fallback
+        text = await core.compose(instr, fallback, strong=f.kind in STRONG_KINDS) if instr else fallback
         msg = await notify.deliver(text, f.kind, meta={"followup_id": fid, "quick_replies": quick})
     _mark_sent(fid)
     return msg
@@ -321,6 +356,9 @@ def _mark_sent(fid: int) -> None:
     _mark(fid, "sent")
     bus.publish("data_changed", ["followups"])
 
+
+# proactive messages worth the stronger model (the weekly planning session lays out the whole next week)
+STRONG_KINDS = {"weekly_planning"}
 
 # task reminders that fall due together are sent as one message (one model call instead of several)
 BATCHABLE = {"deadline", "task_checkin", "overdue"}

@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { ArrowLeftRight, ArrowLeft, Car, MapPin, Plus, Trash2 } from "lucide-react";
+import { ArrowLeftRight, ArrowLeft, Car, LocateFixed, MapPin, Plus, Trash2 } from "lucide-react";
 import { api, type PlacesData } from "../api";
 import { useData, useLive } from "../live";
 import { fa } from "../util";
@@ -23,6 +23,7 @@ export function PlacesCard() {
   const [name, setName] = useState("");
   const [kind, setKind] = useState("other");
   const [aliases, setAliases] = useState("");
+  const [location, setLocation] = useState("");
   const [from, setFrom] = useState("");
   const [to, setTo] = useState("");
   const [minutes, setMinutes] = useState("");
@@ -49,11 +50,17 @@ export function PlacesCard() {
         name: name.trim(),
         kind,
         aliases: aliases.split(/[,،]/).map((a) => a.trim()).filter(Boolean),
+        location: location.trim() || undefined,
       });
       setName("");
       setAliases("");
+      setLocation("");
       setKind("other");
     }, "مکان اضافه شد");
+  const locate = (id: number, current: string) => {
+    const v = window.prompt("آدرس، لینک گوگل‌مپ/نشان/بلد یا «عرض,طول» این مکان:", current);
+    if (v && v.trim()) run(() => api.patch(`/api/places/${id}`, { location: v.trim() }), "مکان روی نقشه ثبت شد");
+  };
   const addTravel = () =>
     from && to && minutes &&
     run(async () => {
@@ -65,7 +72,8 @@ export function PlacesCard() {
     <Card title="مکان‌ها و رفت‌وآمد" icon={<MapPin className="size-4 text-rose-500" />}>
       <p className="mb-3 text-xs leading-6 text-slate-500 dark:text-slate-400">
         اگر محل کلاس یا قرار با یکی از این مکان‌ها (یا اسم مستعارش) جور باشد، زمان حاضر شدن و مسیر خودکار در برنامه حساب می‌شود
-        و موقع راه افتادن یادآوری می‌کنم. لازم نیست اینجا پر کنی؛ در چت هم بگویی («از خونه تا شرکت ۴۰ دقیقه با مترو») ثبت می‌شود.
+        و موقع راه افتادن یادآوری می‌کنم. برای ماشین و تاکسی، زمان مسیر با ترافیک هر ساعت تنظیم می‌شود و از سفرهایی که
+        گزارش می‌دهی («امروز ۵۰ دقیقه طول کشید») یاد می‌گیرد. لازم نیست اینجا پر کنی؛ در چت هم بگویی («از خونه تا شرکت ۴۰ دقیقه با مترو») ثبت می‌شود.
       </p>
 
       <div className="space-y-2">
@@ -80,6 +88,13 @@ export function PlacesCard() {
               <span className="text-xs text-slate-500">از خانه {fa(p.from_home_minutes)} دقیقه</span>
             )}
             <button
+              className={p.lat !== null ? "text-emerald-500" : "text-slate-400 hover:text-brand-600"}
+              title={p.lat !== null ? `روی نقشه: ${p.address || `${p.lat}, ${p.lon}`}` : "ثبت مکان روی نقشه (برای اندازه‌گیری مسیرها)"}
+              onClick={() => locate(p.id, p.address)}
+            >
+              <LocateFixed className="size-4" />
+            </button>
+            <button
               className="ms-auto text-slate-400 hover:text-rose-600"
               title="حذف"
               onClick={() => window.confirm(`«${p.name}» حذف شود؟`) && run(() => api.del(`/api/places/${p.id}`), "حذف شد")}
@@ -90,10 +105,17 @@ export function PlacesCard() {
         ))}
         {data.places.length === 0 && <p className="text-sm text-slate-400">هنوز مکانی ثبت نشده — از «خانه» شروع کن.</p>}
       </div>
-      <div className="mt-3 grid gap-2 sm:grid-cols-[1fr_9rem_1fr_auto]">
+      <div className="mt-3 grid gap-2 sm:grid-cols-[1fr_9rem_1fr]">
         <Input placeholder="اسم مکان (مثلاً شرکت)" value={name} onChange={(e) => setName(e.target.value)} />
         <Select value={kind} onChange={setKind} options={kinds} />
         <Input placeholder="اسم‌های دیگر، با ویرگول (دفتر، کار)" value={aliases} onChange={(e) => setAliases(e.target.value)} />
+      </div>
+      <div className="mt-2 flex gap-2">
+        <Input
+          placeholder="اختیاری: آدرس یا لینک نقشه — زمان مسیرها از روی نقشه حساب می‌شود"
+          value={location}
+          onChange={(e) => setLocation(e.target.value)}
+        />
         <Button variant="soft" onClick={addPlace} disabled={!name.trim()}><Plus className="size-4" /> افزودن</Button>
       </div>
 
@@ -109,6 +131,7 @@ export function PlacesCard() {
                 <span className="font-semibold">{fa(t.minutes)} دقیقه</span>
                 {t.mode && <span className="text-xs text-slate-500">({modeLabel(t.mode)})</span>}
                 {t.samples > 1 && <span className="text-[11px] text-slate-400">میانگین {fa(t.samples)} بار</span>}
+                {t.estimated && <span className="text-[11px] text-slate-400">تخمین از نقشه{t.distance_km ? ` · ${fa(t.distance_km)} کیلومتر` : ""}</span>}
                 <button className="ms-auto text-slate-400 hover:text-rose-600" title="حذف" onClick={() => run(() => api.del(`/api/travel/${t.id}`), "حذف شد")}>
                   <Trash2 className="size-4" />
                 </button>

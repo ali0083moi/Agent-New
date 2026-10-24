@@ -17,17 +17,28 @@ from .db import Message, session
 log = logging.getLogger(__name__)
 
 
-def store_message(role: str, content: str, channel: str, kind: str = "chat", meta: dict[str, Any] | None = None) -> dict[str, Any]:
+def store_message(role: str, content: str, channel: str, kind: str = "chat", meta: dict[str, Any] | None = None,
+                  session_id: int | None = None) -> dict[str, Any]:
+    from . import jobs, sessions
+
+    ended = None
     with session() as s:
-        m = Message(role=role, content=content, channel=channel, kind=kind, meta=meta or {}, created_at=timeutil.now())
+        if session_id is None:
+            session_id, ended = sessions.for_new_message(s)
+        m = Message(role=role, content=content, channel=channel, kind=kind, meta=meta or {}, created_at=timeutil.now(),
+                    session_id=session_id)
         s.add(m)
         s.flush()
+        sessions.touch(s, session_id, role, content)
         data = serialize.message(m)
         if role == "user":
             prefs.set("last_user_message_at", timeutil.iso(m.created_at), s=s)
             from . import insights
 
             insights.mark_responded(s, m.created_at)
+    if ended is not None:
+        jobs.session_ended(ended)
+        bus.publish("sessions", {"current": session_id})
     bus.publish("message", data)
     return data
 

@@ -11,7 +11,7 @@ from fastapi import Depends, FastAPI
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import db, telegram
+from . import db, prefs, telegram
 from .api import auth, routes
 from .config import get_settings
 
@@ -63,6 +63,13 @@ async def announce_new_version() -> None:
 async def lifespan(app: FastAPI):
     st = get_settings()
     db.init_engine()
+    from . import sessions
+
+    with db.session() as s:
+        sessions.adopt_legacy(s)  # messages from before chat sessions existed
+        switched = prefs.apply_model_defaults(s)
+    if switched:
+        log.info("switched to the recommended models: %s", switched)
     Path(st.upload_dir).mkdir(parents=True, exist_ok=True)
     if not st.gapgpt_api_key:
         log.warning("GAPGPT_API_KEY is not set — the assistant cannot reply until you add it to .env")

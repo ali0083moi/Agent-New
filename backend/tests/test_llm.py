@@ -99,10 +99,10 @@ def test_fallback_to_next_model(server):
     srv, llm = server
     srv.broken.add("gpt-4.1")
     res = run(llm.chat([{"role": "user", "content": "hi"}], model="gpt-4.1"))
-    assert res.model == "gpt-4o"
+    assert res.model == "deepseek-v4-flash"
     with session() as s:
         rows = s.query(LlmUsage).order_by(LlmUsage.id).all()
-        assert [(r.model, r.ok) for r in rows] == [("gpt-4.1", False), ("gpt-4o", True)]
+        assert [(r.model, r.ok) for r in rows] == [("gpt-4.1", False), ("deepseek-v4-flash", True)]
 
 
 def test_streaming_text_and_tool_calls(server):

@@ -44,8 +44,20 @@ def fresh_db(tmp_path, monkeypatch, clock):
     monkeypatch.setenv("UPLOAD_DIR", str(tmp_path / "uploads"))
     get_settings.cache_clear()
     db.init_engine()
+    from app import sessions
+
+    with db.session() as s:
+        sessions.current(s)  # the conversation session tests' messages belong to
     yield
     get_settings.cache_clear()
+
+
+def sid() -> int:
+    """Current chat session id (tests that insert Message rows directly)."""
+    from app import sessions
+
+    with db.session() as s:
+        return sessions.current_id(s)
 
 
 class FakeLLM:

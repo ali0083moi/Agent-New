@@ -37,8 +37,11 @@ HELP = (
     "هر چی داری بهم بگو: کلاس‌ها، تکلیف‌ها، ددلاین‌ها، قرارها… خودم ثبت می‌کنم و پیگیرت می‌شم.\n"
     "می‌تونی عکس برنامه کلاسی یا ویس هم بفرستی.\n\n"
     "/today برنامه امروز\n/tasks کارهای باز\n/plan برنامه‌ریزی\n/stats آمار کار مفید\n/report گزارش هفتگی\n"
-    "/habits عادت‌ها\n/ielts وضعیت آیلتس\n/vocab مرور لغت\n/undo برگرداندن آخرین تغییر\n/stop توقف تایمر"
+    "/habits عادت‌ها\n/ielts وضعیت آیلتس\n/vocab مرور لغت\n/undo برگرداندن آخرین تغییر\n/stop توقف تایمر\n"
+    "/new شروع گفتگوی جدید (حافظه بلندمدت سر جاشه)"
 )
+NEW_SESSION_TEXT = ("🆕 گفتگوی جدید شروع شد. چیزهایی که درباره‌ات می‌دونم و کارها و برنامه‌ات سر جاشونه؛ "
+                    "فقط تاریخچه این گفتگو از صفر شروع می‌شه.")
 
 
 # ---------------------------------------------------------------- markdown -> telegram html
@@ -309,6 +312,7 @@ class TelegramBot:
 
     async def _set_commands(self) -> None:
         cmds = [
+            {"command": "new", "description": "گفتگوی جدید"},
             {"command": "today", "description": "برنامه امروز"},
             {"command": "tasks", "description": "کارهای باز"},
             {"command": "plan", "description": "برنامه‌ریزی کارها"},
@@ -376,6 +380,16 @@ class TelegramBot:
             cmd = text.split()[0].split("@")[0].lower()
             if cmd in ("/start", "/help"):
                 await self.send(chat_id, HELP)
+                return
+            if cmd == "/new":
+                from . import jobs, sessions
+                from .db import session
+
+                with session() as s:
+                    _, ended = sessions.new_session(s)
+                if ended is not None:
+                    jobs.session_ended(ended)
+                await self.send(chat_id, NEW_SESSION_TEXT)
                 return
             if cmd in COMMANDS:
                 text = COMMANDS[cmd]

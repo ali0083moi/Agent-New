@@ -600,3 +600,97 @@ def list_contacts(s: Session, ctx: Ctx, status: str | None = None):
     if status:
         data["contacts"] = [c for c in data["contacts"] if c["status"] == status]
     return data
+
+
+# ------------------------------------------------------------------ tool groups
+from . import toolsets  # noqa: E402
+
+
+@tool(
+    "load_tools",
+    "Load more tools for the rest of this turn when the ones you have don't cover the request. Groups: "
+    + toolsets.catalog(),
+    {"groups": {"type": "array", "items": {"type": "string", "enum": list(toolsets.GROUPS)}}},
+    ["groups"],
+)
+def load_tools(s: Session, ctx: Ctx, groups: list[str]):
+    new = [g for g in groups if g in toolsets.GROUPS and g not in ctx.groups]
+    ctx.groups.update(new)
+    out: dict[str, Any] = {"loaded": new, "tools": [t for g in new for t in toolsets.GROUPS[g].tools]}
+    guide = toolsets.guides(new)
+    if guide:
+        out["instructions"] = guide
+    return out
+
+
+# ------------------------------------------------------------------ places & travel
+from .. import places as places_mod  # noqa: E402
+from ..db import Place  # noqa: E402
+
+
+@tool(
+    "set_place",
+    "Add or update a place the user goes to (home, company, university, language school, gym…) with every "
+    "nickname they use. Locations of classes/events are matched to places by name or nickname.",
+    {"name": {"type": "string"},
+     "kind": {"type": "string", "enum": list(places_mod.KIND_FA)},
+     "aliases": {"type": "array", "items": {"type": "string"}, "description": "nicknames, e.g. ['شرکت', 'دفتر']"},
+     "address": {"type": "string"}},
+    ["name"],
+    changes=("places", "schedule"),
+)
+def set_place(s: Session, ctx: Ctx, name: str, kind: str | None = None, aliases: list[str] | None = None,
+              address: str | None = None):
+    p = places_mod.resolve(s, name)
+    if p is None:
+        p = Place(name=name.strip(), kind=kind or "other", aliases=[], address=address or "")
+        s.add(p)
+        s.flush()
+        journal.created(s, ctx, p, f"مکان «{p.name}»")
+    else:
+        journal.before_update(s, ctx, p, f"مکان «{p.name}»")
+    if kind:
+        p.kind = kind
+    if address is not None:
+        p.address = address
+    if aliases:
+        known = {places_mod.norm(a) for a in [p.name, *(p.aliases or [])]}
+        p.aliases = [*(p.aliases or []), *[a for a in aliases if places_mod.norm(a) not in known]]
+    s.flush()
+    planner.invalidate(s)
+    return {"place": places_mod.place_dict(s, p)}
+
+
+@tool(
+    "set_travel_time",
+    "Door-to-door travel time between two places (by name or nickname). observed=true when the user reports how "
+    "long a real trip took (blended into the average) instead of their usual estimate.",
+    {"from_place": {"type": "string"}, "to_place": {"type": "string"},
+     "minutes": {"type": "integer"},
+     "mode": {"type": "string", "description": "car | taxi | metro | bus | walk | bike"},
+     "both_ways": {"type": "boolean", "description": "default true"},
+     "observed": {"type": "boolean"}},
+    ["from_place", "to_place", "minutes"],
+    changes=("places", "schedule"),
+)
+def set_travel_time(s: Session, ctx: Ctx, from_place: str, to_place: str, minutes: int, mode: str = "",
+                    both_ways: bool = True, observed: bool = False):
+    a, b = places_mod.resolve(s, from_place), places_mod.resolve(s, to_place)
+    missing = [n for n, p in ((from_place, a), (to_place, b)) if p is None]
+    if missing:
+        return {"error": f"unknown place(s): {', '.join(missing)} — add them with set_place first",
+                "known": [p.name for p in s.query(Place).all()]}
+    if a.id == b.id:
+        return {"error": "from_place and to_place are the same place"}
+    row = places_mod.set_travel(s, a, b, int(minutes), mode, both_ways, observed)
+    planner.invalidate(s)
+    ctx.replan = True
+    return {"travel": {"from": a.name, "to": b.name, "minutes": row.minutes, "mode": row.mode,
+                       "both_ways": both_ways, "averaged_from": row.samples}}
+
+
+@tool("list_places", "Known places, travel times between them and the getting-ready time.", {})
+def list_places(s: Session, ctx: Ctx):
+    prep, known = places_mod.prep_minutes(s)
+    return {"places": [places_mod.place_dict(s, p) for p in s.query(Place).order_by(Place.id)],
+            "travel": places_mod.travel_rows(s), "prep_minutes": prep, "prep_known": known}

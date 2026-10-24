@@ -37,11 +37,23 @@ def _now() -> datetime:
     return timeutil.now()
 
 
+class ChatSession(Base):
+    """A conversation thread. Web and Telegram share the current one; old ones stay browsable on the web."""
+
+    __tablename__ = "chat_sessions"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str] = mapped_column(String(120), default="")
+    summary: Mapped[str] = mapped_column(Text, default="")  # written when the session ends, carried into the next one
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    last_message_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
 class Message(Base):
-    """One unified conversation shared by the web UI and Telegram."""
+    """A chat message (web and Telegram share the same sessions)."""
 
     __tablename__ = "messages"
     id: Mapped[int] = mapped_column(primary_key=True)
+    session_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     role: Mapped[str] = mapped_column(String(16))  # user | assistant
     content: Mapped[str] = mapped_column(Text, default="")
     channel: Mapped[str] = mapped_column(String(16), default="web")  # web | telegram | system
@@ -110,6 +122,31 @@ class Project(Base):
     description: Mapped[str] = mapped_column(Text, default="")
     status: Mapped[str] = mapped_column(String(16), default="active")  # active | paused | done
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class Place(Base):
+    """Somewhere the user goes (home, company, university, language school, gym...)."""
+
+    __tablename__ = "places"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(80))
+    aliases: Mapped[list[str]] = mapped_column(JSON, default=list)
+    kind: Mapped[str] = mapped_column(String(24), default="other")  # home | work | university | class | gym | other
+    address: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class TravelTime(Base):
+    """Door-to-door travel time between two places (one direction; the reverse is assumed equal if missing)."""
+
+    __tablename__ = "travel_times"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    from_place_id: Mapped[int] = mapped_column(ForeignKey("places.id", ondelete="CASCADE"), index=True)
+    to_place_id: Mapped[int] = mapped_column(ForeignKey("places.id", ondelete="CASCADE"), index=True)
+    minutes: Mapped[int] = mapped_column(Integer)
+    mode: Mapped[str] = mapped_column(String(24), default="")  # car | taxi | metro | bus | walk | bike
+    samples: Mapped[int] = mapped_column(Integer, default=1)  # how many reports the value is averaged from
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
 
 class Contact(Base):
@@ -267,6 +304,7 @@ class Summary(Base):
 
     __tablename__ = "summaries"
     id: Mapped[int] = mapped_column(primary_key=True)
+    session_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     start_message_id: Mapped[int] = mapped_column(Integer)
     end_message_id: Mapped[int] = mapped_column(Integer, index=True)
     content: Mapped[str] = mapped_column(Text)
@@ -439,6 +477,9 @@ def _auto_migrate(engine) -> None:
                     elif isinstance(v, str):
                         default = " DEFAULT '" + v.replace("'", "''") + "'"
                 conn.execute(text(f'ALTER TABLE "{table.name}" ADD COLUMN "{col.name}" {ddl}{default}'))
+                if col.index:
+                    conn.execute(text(f'CREATE INDEX IF NOT EXISTS "ix_{table.name}_{col.name}" '
+                                      f'ON "{table.name}" ("{col.name}")'))
 
 
 @contextmanager

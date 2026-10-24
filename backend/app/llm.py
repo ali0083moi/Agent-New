@@ -208,7 +208,10 @@ class LLM:
             if purpose in BACKGROUND_PURPOSES:
                 raise BudgetExceeded("سقف هزینه روزانه پر شده است")
             primary = self.model("fast")  # degrade gracefully instead of going silent
-        candidates = [primary] + [m for m in self._split(self.settings.fallback_models) if m != primary]
+        from . import prefs
+
+        fallbacks = prefs.get("llm_fallback_models") or self.settings.fallback_models
+        candidates = [primary] + [m for m in self._split(fallbacks) if m != primary]
         last: Exception | None = None
         for m in candidates:
             started = time.monotonic()

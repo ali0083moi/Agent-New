@@ -31,7 +31,9 @@ DEFAULTS: dict[str, Any] = {
     "min_block_minutes": 30,
     "break_minutes": 15,
     "max_focus_minutes_per_day": 360,
-    "class_buffer_minutes": 30,
+    "class_buffer_minutes": 30,  # used for classes at places without a known travel time
+    "prep_minutes": None,  # getting ready before leaving home (None = not asked yet; 30 is assumed)
+    "leave_reminders": True,  # "time to get ready / leave" before appointments somewhere else
     "default_task_minutes": 60,
     "daily_focus_goal_minutes": 240,
     "semester_start": None,  # ISO date, used for odd/even week parity
@@ -39,6 +41,8 @@ DEFAULTS: dict[str, Any] = {
     "rescue_mode": True,  # proactive "you're falling behind" help
     "weekly_planning_day": "fri",
     "weekly_planning_time": "17:00",
+    # chat sessions: a new conversation starts after this many idle hours (0 = never automatically)
+    "session_idle_hours": 6,
     # learning & memory
     "semantic_memory": True,
     "auto_facts": True,
@@ -62,10 +66,21 @@ DEFAULTS: dict[str, Any] = {
     "llm_fast_model": "",
     "llm_vision_model": "",
     "llm_ielts_model": "",
+    "llm_fallback_models": "",  # comma separated; '' = FALLBACK_MODELS from .env
+}
+
+# cheap models that did best in the evals (python -m app.evals, Oct 2026): written once into the settings of
+# installs that still use the old defaults from .env, unless the user already picked models in Settings
+MODEL_DEFAULTS_VERSION = 2
+RECOMMENDED_MODELS = {
+    "llm_chat_model": "gemini-3.1-flash-lite",
+    "llm_fast_model": "deepseek-v4-flash",
+    "llm_fallback_models": "deepseek-v4-flash,gpt-4.1-mini",
 }
 
 # app state keys (not user preferences)
-STATE_KEYS = {"telegram_chat_id", "telegram_user", "telegram_offset", "pairing_code", "last_user_message_at"}
+STATE_KEYS = {"telegram_chat_id", "telegram_user", "telegram_offset", "pairing_code", "last_user_message_at",
+              "current_session_id", "model_defaults_version"}
 
 
 def get(key: str, default: Any = None, s: Session | None = None) -> Any:
@@ -98,3 +113,17 @@ def all_prefs(s: Session | None = None) -> dict[str, Any]:
     for row in s.query(KV).filter(KV.key.in_(list(DEFAULTS))).all():
         out[row.key] = row.value
     return out
+
+
+def apply_model_defaults(s: Session) -> dict[str, str]:
+    """One-time switch to the recommended models (see RECOMMENDED_MODELS). Returns what was changed."""
+    if int(get("model_defaults_version", 0, s=s) or 0) >= MODEL_DEFAULTS_VERSION:
+        return {}
+    changed = {}
+    if not get("llm_chat_model", s=s) and not get("llm_fast_model", s=s):
+        for key, value in RECOMMENDED_MODELS.items():
+            if not get(key, s=s):
+                set(key, value, s=s)
+                changed[key] = value
+    set("model_defaults_version", MODEL_DEFAULTS_VERSION, s=s)
+    return changed

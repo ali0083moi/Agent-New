@@ -13,7 +13,7 @@ from typing import Any, Callable
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from .. import cal, followups, journal, planner, prefs, projects, serialize, stats, timeutil
+from .. import cal, followups, insights, journal, planner, prefs, projects, serialize, stats, timeutil
 from ..db import (Commitment, Contact, Event, Followup, Goal, Habit, Memory, PlannedBlock, Project, RecurringEvent,
                   Task, VocabWord, WorkLog, session)
 
@@ -22,7 +22,7 @@ log = logging.getLogger(__name__)
 CATEGORIES = ["work", "university", "language", "personal", "health", "other"]
 REC_KINDS = list(cal.KIND_CATEGORY)
 EVENT_KINDS = ["appointment", "outing", "exam", "meeting", "deadline", "other"]
-DT_HELP = "Local datetime 'YYYY-MM-DD HH:MM'. Gregorian, or Jalali if year<1700 (e.g. '1405-08-03 18:00')."
+DT_HELP = "'YYYY-MM-DD HH:MM' (see Dates in the instructions)."
 
 
 @dataclass
@@ -32,6 +32,7 @@ class Ctx:
     turn_id: str | None = None  # groups this turn's changes for undo
     trusted: bool = False  # explicit action in the web UI (skips the delete confirmation)
     replan: bool = False
+    groups: set[str] = field(default_factory=set)  # tool groups loaded for this turn (see toolsets)
 
 
 # tools after which the plan doesn't need to be refreshed
@@ -71,8 +72,11 @@ def tool(name: str, description: str, properties: dict[str, Any], required: list
     return deco
 
 
-def schemas() -> list[dict[str, Any]]:
-    return [t.schema() for t in REGISTRY.values()]
+def schemas(names: list[str] | None = None) -> list[dict[str, Any]]:
+    """All tool definitions, or only `names` (in that order)."""
+    if names is None:
+        return [t.schema() for t in REGISTRY.values()]
+    return [REGISTRY[n].schema() for n in names if n in REGISTRY]
 
 
 # id-like arguments -> the table they must exist in
@@ -149,17 +153,34 @@ def coerce_args(spec: "ToolSpec", args: dict[str, Any]) -> tuple[dict[str, Any],
     return out, notes
 
 
-def _check_refs(s: Session, spec: "ToolSpec", args: dict[str, Any]) -> list[str]:
-    """Optional links that point to nothing are dropped (instead of crashing the whole save)."""
-    required = set(spec.parameters.get("required", []))
+def _drop_bad_refs(s: Session, obj: dict[str, Any], required: set[str], where: str = "") -> list[str]:
     notes = []
-    for key in list(args):
+    for key in list(obj):
         model = REF_MODELS.get(key)
-        if model is None or key in required or not isinstance(args[key], int):
+        if model is None or key in required:
             continue
-        if s.get(model, args[key]) is None:
-            notes.append(f"{key}={args[key]} does not exist — saved without it (use names from the context, never guess ids)")
-            args.pop(key)
+        value = obj[key]
+        if isinstance(value, str) and timeutil.to_latin_digits(value).strip().isdigit():
+            value = obj[key] = int(timeutil.to_latin_digits(value).strip())
+        if value is None or (isinstance(value, int) and s.get(model, value) is not None):
+            continue
+        notes.append(f"{where}{key}={value!r} does not exist — saved without it (use names from the context, never guess ids)")
+        obj.pop(key)
+    return notes
+
+
+def _check_refs(s: Session, spec: "ToolSpec", args: dict[str, Any]) -> list[str]:
+    """Optional links that point to nothing are dropped (instead of crashing the whole save) — also inside
+    lists of objects, e.g. each class in add_recurring_events."""
+    props = spec.parameters.get("properties", {})
+    notes = _drop_bad_refs(s, args, set(spec.parameters.get("required", [])))
+    for key, value in args.items():
+        item_schema = (props.get(key) or {}).get("items") or {}
+        if isinstance(value, list) and item_schema.get("type") == "object":
+            required = set(item_schema.get("required", []))
+            for i, item in enumerate(value):
+                if isinstance(item, dict):
+                    notes += _drop_bad_refs(s, item, required, f"{key}[{i}].")
     return notes
 
 
@@ -383,6 +404,13 @@ def add_task(
         category = cal.KIND_CATEGORY.get(rec.kind, "personal")
     if rec is not None and not goal_id:
         goal_id = rec.goal_id
+    learned = insights.suggest_minutes(s, title, _cat(category))
+    history_note = None
+    if learned is not None:
+        if estimated_minutes is None:
+            estimated_minutes, history_note = learned[0], f"estimate taken from history: {learned[1]}"
+        elif not 0.66 <= estimated_minutes / max(learned[0], 1) <= 1.5:
+            history_note = f"your estimate differs from history ({learned[1]}) — consider adjusting it with update_task"
     t = Task(
         title=title.strip(),
         description=description or "",
@@ -406,6 +434,8 @@ def add_task(
         "task": serialize.task(s, t),
         "reminders_scheduled": [timeutil.iso(f.due_at) for f in planned if f.kind != "overdue"],
     }
+    if history_note:
+        out["duration_history"] = history_note
     if warnings:
         out["warnings"] = warnings
     return out
@@ -742,15 +772,23 @@ def delete_event(s: Session, ctx: Ctx, event_id: int, confirmed: bool = False):
         "start": {"type": "string", "description": DT_HELP},
         "end": {"type": "string", "description": DT_HELP + " or HH:MM"},
         "duration_minutes": {"type": "integer"},
-        "buffer_minutes": {"type": "integer", "description": "Travel/prep time to add on each side (default 30)."},
+        "place": {"type": "string", "description": "Where it is, if it's a known place (adds getting ready + travel)."},
+        "buffer_minutes": {"type": "integer", "description": "Travel time on each side if the place is unknown (default 30)."},
     },
     ["start"],
 )
 def check_availability(s: Session, ctx: Ctx, start: str, end: str | None = None, duration_minutes: int | None = None,
-                       buffer_minutes: int = 30):
+                       place: str | None = None, buffer_minutes: int = 30):
+    from .. import places
+
     st = timeutil.parse_datetime(start)
     en = _parse_end(st, end, duration_minutes, default=180)
-    return planner.check_availability(s, st, en, int(buffer_minutes))
+    trip = places.trip_for(s, place, st, en) if place else None
+    if trip is None:
+        return planner.check_availability(s, st, en, int(buffer_minutes))
+    res = planner.check_availability(s, st, en, before_minutes=trip["before"], after_minutes=trip["after"])
+    res["trip"] = trip
+    return res
 
 
 @tool(
@@ -1056,6 +1094,7 @@ async def weekly_report(ctx: Ctx, week_offset: int = 0, project: str | None = No
     "voice_replies (off|when_voice|always), auto_replan, rescue_mode, weekly_planning_day, weekly_planning_time, "
     "ielts_target_band, ielts_exam_date, vocab_review_time, vocab_daily_count, daily_budget_usd, "
     "adaptive_reminders, semantic_memory, auto_facts, professor_followup_days, "
+    "prep_minutes (getting ready before leaving home), leave_reminders, session_idle_hours, "
     "llm_chat_model / llm_fast_model / llm_vision_model / "
     "llm_ielts_model (override AI models; '' = default). "
     "Special key current_week_parity ('odd'|'even') tells which university week (فرد/زوج) the current week is.",
@@ -1082,6 +1121,13 @@ def update_preferences(s: Session, ctx: Ctx, changes: dict[str, Any]):
             value = timeutil.normalize_weekday(value)
         if key in ("semester_start", "ielts_exam_date") and value:
             value = timeutil.parse_date(value).isoformat()
+        default = prefs.DEFAULTS[key]
+        numeric = key == "prep_minutes" or (isinstance(default, (int, float)) and not isinstance(default, bool))
+        if numeric and value not in (None, "") and not isinstance(value, bool):
+            n = float(_num(value, integer=False))
+            value = int(n) if n.is_integer() and not isinstance(default, float) else n
+        elif key == "prep_minutes" and value == "":
+            value = None
         journal.pref_change(s, ctx, key, prefs.get(key, s=s))
         prefs.set(key, value, s=s)
         applied[key] = value

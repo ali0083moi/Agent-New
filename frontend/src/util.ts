@@ -145,6 +145,7 @@ export const FOLLOWUP_KIND: Record<string, string> = {
   habit_reminder: "یادآوری عادت",
   vocab_review: "مرور لغت",
   contact_followup: "پیگیری استاد",
+  leave: "وقت راه افتادن",
   deploy: "به‌روزرسانی",
 };
 

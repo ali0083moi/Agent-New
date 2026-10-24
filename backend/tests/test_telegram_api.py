@@ -1,7 +1,7 @@
 import asyncio
 
 import pytest
-from conftest import call
+from conftest import call, sid
 from fastapi.testclient import TestClient
 
 from app import prefs, telegram
@@ -89,7 +89,7 @@ def test_pairing_then_chat(bot, fake_llm):
 def test_quick_reply_callback(bot, fake_llm):
     prefs.set("telegram_chat_id", 42)
     with session() as s:
-        m = Message(role="assistant", content="شروع کنیم؟", channel="system", kind="block_start",
+        m = Message(session_id=sid(), role="assistant", content="شروع کنیم؟", channel="system", kind="block_start",
                     meta={"quick_replies": ["شروع کردم ▶️", "بعداً"]})
         s.add(m)
         s.flush()

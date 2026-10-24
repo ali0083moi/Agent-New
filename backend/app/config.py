@@ -18,8 +18,8 @@ class Settings(BaseSettings):
     # --- LLM (GapGPT, OpenAI-compatible) ---
     gapgpt_api_key: str = ""
     gapgpt_base_url: str = "https://api.gapgpt.app/v1"
-    chat_model: str = "gpt-4.1"
-    fast_model: str = "gpt-4.1-mini"
+    chat_model: str = "gemini-3.1-flash-lite"  # best score + cheap in the evals (Oct 2026)
+    fast_model: str = "deepseek-v4-flash"
     vision_model: str = "gpt-4.1"
     ielts_model: str = ""  # grading essays/speaking; empty = chat_model
     transcribe_model: str = "gapgpt/whisper-1"
@@ -27,7 +27,7 @@ class Settings(BaseSettings):
     tts_voice: str = "nova"
     embedding_model: str = "text-embedding-3-small"
     # tried in order when the main model fails (comma separated)
-    fallback_models: str = "gpt-4o,gpt-4.1-mini"
+    fallback_models: str = "deepseek-v4-flash,gpt-4.1-mini"
     transcribe_fallback_models: str = "whisper-1"
     tts_fallback_models: str = "tts-1"
     llm_timeout: float = 90.0

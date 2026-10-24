@@ -1,4 +1,4 @@
-"""The conversational agent: one shared conversation for web + Telegram."""
+"""The conversational agent. Web and Telegram share the current chat session (see sessions.py)."""
 
 from __future__ import annotations
 
@@ -13,17 +13,22 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from .. import jobs, journal, memory, notify, prefs, timeutil
+from .. import jobs, journal, memory, notify, prefs, sessions, timeutil
 from ..bus import bus
 from ..config import get_settings
 from ..db import Message, session
 from ..llm import LLMError, get_llm
-from . import prompt, tools
+from . import prompt, tools, toolsets
 
 log = logging.getLogger(__name__)
 
 MAX_STEPS = 10
 HISTORY_LIMIT = memory.HISTORY_WINDOW
+# older messages in the verbatim history are shortened; the last few stay complete
+FULL_RECENT = 4
+OLD_USER_CHARS = 700
+OLD_ASSISTANT_CHARS = 450
+TOOL_RESULT_CHARS = 8000
 lock = asyncio.Lock()
 
 VISION_PROMPT = """You are helping a personal-assistant app. Analyse this image carefully.
@@ -84,6 +89,8 @@ TOOL_LABELS = {
     "update_project": "📁 ویرایش پروژه",
     "add_contact": "🎓 استاد",
     "update_contact": "🎓 پیگیری استاد",
+    "set_place": "📍 مکان",
+    "set_travel_time": "🚗 زمان مسیر",
 }
 STATUS_LABELS = {
     "grade_ielts_writing": "در حال تصحیح رایتینگ…",
@@ -95,7 +102,7 @@ STATUS_LABELS = {
 }
 READ_ONLY = {"get_agenda", "list_tasks", "list_recurring_events", "get_stats", "list_followups", "list_habits",
              "list_commitments", "ielts_progress", "vocab_due", "get_insights", "rescue_plan", "check_availability",
-             "list_projects", "list_contacts", "start_speaking_practice"}
+             "list_projects", "list_contacts", "start_speaking_practice", "list_places", "load_tools"}
 
 # the reply says something was stored, although nothing was
 CLAIM_RE = re.compile(
@@ -155,12 +162,27 @@ def _summary(name: str, args: dict[str, Any], result: dict[str, Any]) -> str:
     return label
 
 
-def _history_messages(limit: int = HISTORY_LIMIT, exclude_id: int | None = None) -> list[dict[str, Any]]:
+def _shorten(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[:limit].rstrip() + " …[shortened]"
+
+
+def _history_rows(session_id: int, limit: int, exclude_id: int | None = None) -> list[Message]:
     with session() as s:
-        rows = s.query(Message).order_by(Message.id.desc()).limit(limit + 1).all()
-    rows = [r for r in reversed(rows) if r.id != exclude_id][-limit:]
+        rows = (s.query(Message).filter(Message.session_id == session_id)
+                .order_by(Message.id.desc()).limit(limit + 1).all())
+    return [r for r in reversed(rows) if r.id != exclude_id][-limit:]
+
+
+def _history_messages(limit: int = HISTORY_LIMIT, exclude_id: int | None = None,
+                      session_id: int | None = None) -> list[dict[str, Any]]:
+    """The current session's recent messages; older ones are shortened (their gist is in the summaries)."""
+    if session_id is None:
+        with session() as s:
+            session_id = sessions.current_id(s)
+    rows = _history_rows(session_id, limit, exclude_id)
     out: list[dict[str, Any]] = []
-    for m in rows:
+    for i, m in enumerate(rows):
+        old = i < len(rows) - FULL_RECENT
         content = m.content or ""
         meta = m.meta or {}
         if m.role == "user":
@@ -170,8 +192,10 @@ def _history_messages(limit: int = HISTORY_LIMIT, exclude_id: int | None = None)
                 content += "\n\n[تصویر پیوست — تحلیل خودکار]\n" + meta["image_analysis"]
             if meta.get("document_text"):
                 content += f"\n\n[فایل پیوست: {meta.get('document_name', '')}]\n" + meta["document_text"][:3000]
-            out.append({"role": "user", "content": content or "(پیام خالی)"})
+            out.append({"role": "user", "content": _shorten(content, OLD_USER_CHARS) if old else (content or "(پیام خالی)")})
         else:
+            if old:
+                content = _shorten(content, OLD_ASSISTANT_CHARS)
             notes = meta.get("action_log")
             if notes:
                 content += "\n\n[actions done: " + "; ".join(notes) + "]"
@@ -190,6 +214,19 @@ def _history_messages(limit: int = HISTORY_LIMIT, exclude_id: int | None = None)
         else:
             merged.append(msg)
     return merged
+
+
+def _turn_groups(session_id: int, text: str, attachments: list[str] = ()) -> list[str]:
+    """Tool groups for this turn: from the message, the message being answered and the previous turns' groups."""
+    rows = _history_rows(session_id, 6)
+    assistant = [m for m in rows if m.role == "assistant"]
+    last = assistant[-1] if assistant else None
+    sticky: list[str] = []
+    for m in assistant[-2:]:
+        sticky += (m.meta or {}).get("groups", [])
+    texts = [text, last.content if last is not None else ""]
+    kinds = [last.kind] if last is not None and last.kind != "chat" else []
+    return toolsets.select(texts, kinds=kinds, sticky=sticky, attachments=attachments)
 
 
 def _action_log(name: str, args: dict[str, Any], result: dict[str, Any]) -> str:
@@ -211,12 +248,16 @@ def _action_log(name: str, args: dict[str, Any], result: dict[str, Any]) -> str:
     return f"{name}({', '.join(ids)})" if ids else name
 
 
-async def _context_block(query: str) -> str:
-    """Summaries of older conversation + semantically related older messages/memories."""
+async def _context_block(query: str, session_id: int) -> str:
+    """Summaries of this session's older part, the previous session and related long-term memories."""
     parts = []
+    with session() as s:
+        prev = sessions.previous_summary(s, session_id)
+    if prev:
+        parts.append("## Previous conversation (summary)\n" + prev)
     sums = memory.latest_summaries(2)
     if sums:
-        parts.append("## Earlier in our conversation (summaries)\n" + "\n\n".join(x.content for x in sums))
+        parts.append("## Earlier in this conversation (summaries)\n" + "\n\n".join(x.content for x in sums))
     try:
         hits = await memory.recall(query)
     except Exception:  # noqa: BLE001
@@ -247,24 +288,34 @@ async def run_agent(
     model: str | None = None,
     on_delta: DeltaCallback | None = None,
     on_status: DeltaCallback | None = None,
-) -> tuple[str, list[dict[str, Any]], set[str]]:
+    session_id: int | None = None,
+    attachments: list[str] = (),
+) -> tuple[str, list[dict[str, Any]], set[str], list[str]]:
+    """Run one turn. Returns (reply, actions, changed data kinds, tool groups used)."""
     llm = get_llm()
-    with session() as s:
-        system = prompt.system_prompt(s)
     query = user_content if isinstance(user_content, str) else json.dumps(user_content, ensure_ascii=False)
-    extra = await _context_block(query[:2000])
-    if extra:
-        system += "\n\n" + extra
-    messages: list[dict[str, Any]] = [{"role": "system", "content": system}]
-    messages += _history_messages(exclude_id=exclude_id)
-    messages.append({"role": "user", "content": user_content})
+    with session() as s:
+        if session_id is None:
+            session_id = sessions.current_id(s)
     ctx = tools.Ctx(channel=channel, turn_id=turn_id)
+    ctx.groups.update(_turn_groups(session_id, query[:2000], attachments))
+    with session() as s:
+        # static part first (identical on every call → cacheable), then everything that changes
+        static = prompt.persona(s)
+        guide = toolsets.guides(ctx.groups)
+        dynamic = ("## Instructions for the loaded tools\n" + guide + "\n\n" if guide else "") + prompt.build_context(s, ctx.groups)
+    extra = await _context_block(query[:2000], session_id)
+    if extra:
+        dynamic += "\n\n" + extra
+    messages: list[dict[str, Any]] = [{"role": "system", "content": static}, {"role": "system", "content": dynamic}]
+    messages += _history_messages(exclude_id=exclude_id, session_id=session_id)
+    messages.append({"role": "user", "content": user_content})
     actions: list[dict[str, Any]] = []
-    schemas = tools.schemas()
     stream = _Throttle(on_delta, 0.12) if on_delta else None
     verified = False
     try:
         for _ in range(MAX_STEPS):
+            schemas = tools.schemas(toolsets.tool_names(ctx.groups))
             res = await llm.chat(messages, tools=schemas, model=model, on_delta=stream)
             if not res.tool_calls:
                 reply = res.content.strip()
@@ -277,7 +328,7 @@ async def run_agent(
                     if on_status is not None:
                         await on_status("در حال ثبت…")
                     continue
-                return reply, actions, ctx.changed
+                return reply, actions, ctx.changed, sorted(ctx.groups)
             messages.append(res.raw_message)
             for call in res.tool_calls:
                 try:
@@ -300,14 +351,14 @@ async def run_agent(
                     {
                         "role": "tool",
                         "tool_call_id": call.id,
-                        "content": json.dumps(result, ensure_ascii=False, default=str)[:14000],
+                        "content": json.dumps(result, ensure_ascii=False, default=str)[:TOOL_RESULT_CHARS],
                     }
                 )
             if ctx.changed:
                 bus.publish("data_changed", sorted(ctx.changed))
         messages.append({"role": "user", "content": "[system] Stop calling tools now and reply to the user."})
         res = await llm.chat(messages, model=model, on_delta=stream)
-        return res.content.strip(), actions, ctx.changed
+        return res.content.strip(), actions, ctx.changed, sorted(ctx.groups)
     finally:
         tools.finalize(ctx)
 
@@ -363,8 +414,11 @@ async def handle_user_message(
     on_delta: DeltaCallback | None = None,
     on_status: DeltaCallback | None = None,
     model: str | None = None,
+    session_id: int | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Process one user turn. Returns (user_message, assistant_message) dicts."""
+    """Process one user turn. Returns (user_message, assistant_message) dicts.
+
+    session_id: the chat session the user wrote in (web); it becomes the current session. Default: the current one."""
     attachments = attachments or []
     meta = dict(meta or {})
     llm = get_llm()
@@ -422,7 +476,12 @@ async def handle_user_message(
                 meta["image_analysis"] = "\n\n".join(analyses)
             if not content and meta.get("voice") and not files:
                 content = "(ویس نامفهوم بود)"
-            user_msg = notify.store_message("user", content, channel, meta=meta)
+            if session_id is not None:
+                with session() as s:
+                    if sessions.activate(s, session_id) is None:
+                        session_id = None
+            user_msg = notify.store_message("user", content, channel, meta=meta, session_id=session_id)
+            session_id = user_msg["session_id"]
 
             llm_content = content or "(کاربر فقط یک فایل/تصویر فرستاد)"
             if meta.get("forwarded_from"):
@@ -437,12 +496,13 @@ async def handle_user_message(
             if meta.get("voice_error"):
                 llm_content += f"\n\n[system: voice transcription failed: {meta['voice_error']}]"
             try:
-                reply, actions, changed = await run_agent(
+                reply, actions, changed, groups = await run_agent(
                     llm_content, channel, exclude_id=user_msg["id"], turn_id=turn_id, model=model,
-                    on_delta=web_delta, on_status=web_status,
+                    on_delta=web_delta, on_status=web_status, session_id=session_id,
+                    attachments=[a.kind for a in attachments],
                 )
             except LLMError as e:
-                reply, actions, changed = f"⚠️ الان به مدل زبانی دسترسی ندارم.\n`{e}`", [], set()
+                reply, actions, changed, groups = f"⚠️ الان به مدل زبانی دسترسی ندارم.\n`{e}`", [], set(), []
             if not reply:
                 reply = "👌"
             assistant_meta = {
@@ -450,8 +510,9 @@ async def handle_user_message(
                 "action_log": [a["log"] for a in actions if a["tool"] not in READ_ONLY],
                 "turn_id": turn_id,
                 "undoable": journal.has_changes(turn_id),
+                "groups": groups,
             }
-            assistant_msg = notify.store_message("assistant", reply, channel, meta=assistant_meta)
+            assistant_msg = notify.store_message("assistant", reply, channel, meta=assistant_meta, session_id=session_id)
             if changed:
                 bus.publish("data_changed", sorted(changed))
             jobs.after_turn(user_msg["id"])
@@ -461,16 +522,20 @@ async def handle_user_message(
 
 
 async def compose(instruction: str, fallback: str) -> str:
-    """Write a proactive message (no tools) in the assistant's voice."""
+    """Write a proactive message (no tools) in the assistant's voice, with a slim context."""
     llm = get_llm()
     try:
         with session() as s:
-            system = prompt.system_prompt(s)
+            system = prompt.persona(s) + "\n" + prompt.build_context(s, mode="compose")
+            sid = sessions.current_id(s)
+            prev = sessions.previous_summary(s, sid)
         sums = memory.latest_summaries(1)
         if sums:
-            system += "\n\n## Earlier in our conversation (summary)\n" + sums[0].content
+            system += "\n\n## Earlier in this conversation (summary)\n" + sums[0].content
+        elif prev:
+            system += "\n\n## Previous conversation (summary)\n" + prev
         messages = [{"role": "system", "content": system}]
-        messages += _history_messages(limit=12)
+        messages += _history_messages(limit=6, session_id=sid)
         messages.append(
             {
                 "role": "user",

@@ -116,6 +116,7 @@ def followup(f: Followup) -> dict[str, Any]:
 def message(m: Message) -> dict[str, Any]:
     return {
         "id": m.id,
+        "session_id": m.session_id,
         "role": m.role,
         "content": m.content,
         "channel": m.channel,

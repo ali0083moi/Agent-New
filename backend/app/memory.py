@@ -12,13 +12,13 @@ from sqlalchemy import func
 
 from . import prefs, timeutil
 from .config import get_settings
-from .db import Embedding, Memory, Message, Summary, session
+from .db import ChatSession, Embedding, Memory, Message, Summary, session
 from .llm import LLMError, get_llm
 
 log = logging.getLogger(__name__)
 
-HISTORY_WINDOW = 30  # messages sent verbatim to the model (see agent.core)
-SUMMARY_CHUNK = 40
+HISTORY_WINDOW = 20  # messages of the current session sent verbatim to the model (see agent.core)
+SUMMARY_CHUNK = 20  # older messages of a long session are summarized in chunks of this size
 MIN_SCORE = 0.30
 
 _cache: dict[str, Any] = {"max_id": 0, "keys": [], "matrix": None, "model": None}
@@ -114,9 +114,18 @@ def _source_text(stype: str, sid: int) -> tuple[str, str] | None:
     return None
 
 
+def _current_session_id(s) -> int:
+    from . import sessions
+
+    return sessions.current_id(s)
+
+
 def _recent_ids(window: int) -> set[int]:
+    """The messages already in the model's verbatim history (no need to recall them)."""
     with session() as s:
-        return {r[0] for r in s.query(Message.id).order_by(Message.id.desc()).limit(window + 1).all()}
+        sid = _current_session_id(s)
+        return {r[0] for r in s.query(Message.id).filter(Message.session_id == sid)
+                .order_by(Message.id.desc()).limit(window + 1).all()}
 
 
 async def recall(query: str, k: int = 6, window: int = HISTORY_WINDOW) -> list[dict[str, Any]]:
@@ -190,28 +199,34 @@ problems, emotional context, and anything the assistant promised to follow up on
 Mention dates (Jalali) when relevant."""
 
 
+def _transcript(rows: list[Message]) -> str:
+    return "\n".join(
+        f"[{timeutil.jalali_str(m.created_at)} {m.created_at.strftime('%H:%M')}] "
+        f"{'کاربر' if m.role == 'user' else 'دستیار'}: {m.content[:800]}"
+        for m in rows
+    )
+
+
 async def summarize_old(window: int = HISTORY_WINDOW) -> int:
-    """Summarize messages that fell out of the verbatim history window, in chunks."""
+    """Summarize messages of the current session that fell out of the verbatim history window, in chunks."""
     with session() as s:
-        recent = s.query(Message.id).order_by(Message.id.desc()).limit(window).all()
+        sid = _current_session_id(s)
+        recent = s.query(Message.id).filter(Message.session_id == sid).order_by(Message.id.desc()).limit(window).all()
         if len(recent) < window:
             return 0
         cutoff = min(r[0] for r in recent)
-        last_end = s.query(func.coalesce(func.max(Summary.end_message_id), 0)).scalar() or 0
+        last_end = (s.query(func.coalesce(func.max(Summary.end_message_id), 0))
+                    .filter(Summary.session_id == sid).scalar() or 0)
         rows = (
             s.query(Message)
-            .filter(Message.id > last_end, Message.id < cutoff)
+            .filter(Message.session_id == sid, Message.id > last_end, Message.id < cutoff)
             .order_by(Message.id)
             .limit(SUMMARY_CHUNK)
             .all()
         )
         if len(rows) < SUMMARY_CHUNK // 2:
             return 0
-        transcript = "\n".join(
-            f"[{timeutil.jalali_str(m.created_at)} {m.created_at.strftime('%H:%M')}] "
-            f"{'کاربر' if m.role == 'user' else 'دستیار'}: {m.content[:800]}"
-            for m in rows
-        )
+        transcript = _transcript(rows)
         start_id, end_id = rows[0].id, rows[-1].id
     try:
         text = await get_llm().complete(SUMMARY_PROMPT, transcript, purpose="summary")
@@ -219,13 +234,44 @@ async def summarize_old(window: int = HISTORY_WINDOW) -> int:
         log.info("summary skipped: %s", e)
         return 0
     with session() as s:
-        s.add(Summary(start_message_id=start_id, end_message_id=end_id, content=text.strip()))
+        s.add(Summary(session_id=sid, start_message_id=start_id, end_message_id=end_id, content=text.strip()))
     return 1
+
+
+SESSION_SUMMARY_PROMPT = """This chat session between a user and their personal assistant has ended. Write a short
+summary in Persian (max ~8 bullet points) of what matters for the next conversation: open questions, what the
+assistant promised to do or check, decisions, the user's mood/situation, and anything left unfinished. Skip what was
+simply saved (tasks, events) unless it needs follow-up. If nothing matters, answer with an empty string."""
+
+
+async def summarize_session(session_id: int) -> bool:
+    """Summary of a finished session, carried into the next one (see sessions.previous_summary)."""
+    with session() as s:
+        cs = s.get(ChatSession, session_id)
+        if cs is None or cs.summary:
+            return False
+        rows = (s.query(Message).filter(Message.session_id == session_id).order_by(Message.id.desc()).limit(60).all())
+        if sum(1 for m in rows if m.role == "user") < 2:
+            return False
+        earlier = [x.content for x in s.query(Summary).filter(Summary.session_id == session_id).order_by(Summary.id)]
+        transcript = ("\n".join(earlier) + "\n\n" if earlier else "") + _transcript(list(reversed(rows)))
+    try:
+        text = await get_llm().complete(SESSION_SUMMARY_PROMPT, transcript, purpose="summary")
+    except LLMError as e:
+        log.info("session summary skipped: %s", e)
+        return False
+    with session() as s:
+        cs = s.get(ChatSession, session_id)
+        if cs is not None:
+            cs.summary = text.strip() or "-"
+    return True
 
 
 def latest_summaries(n: int = 2) -> list[Summary]:
     with session() as s:
-        rows = s.query(Summary).order_by(Summary.end_message_id.desc()).limit(n).all()
+        sid = _current_session_id(s)
+        rows = (s.query(Summary).filter(Summary.session_id == sid)
+                .order_by(Summary.end_message_id.desc()).limit(n).all())
         for r in rows:
             s.expunge(r)
     return list(reversed(rows))
@@ -243,6 +289,11 @@ Answer ONLY with JSON: {"add":[{"content":"...","category":"profile|preference|r
 "update":[{"id":1,"content":"..."}],"delete":[2]} — use empty lists when nothing is worth saving. Write contents in Persian."""
 
 
+# short replies with nothing to learn from (no model call for them)
+_ACK = re.compile(r"(باشه|اوکی|اوکیه|ok|okay|مرسی|ممنون|ممنونم|دمت گرم|آره|اره|نه|حله|چشم|انجام شد|شروع کردم|تموم شد|"
+                  r"راه افتادم|بعدا|بعداً|نه مرسی)[\s!.؟?👍🙏✅]*", re.I)
+
+
 def _norm(t: str) -> str:
     return re.sub(r"\s+", " ", timeutil.to_latin_digits(t).strip().lower())
 
@@ -252,7 +303,7 @@ async def extract_facts(user_message_id: int) -> dict[str, int]:
         return {}
     with session() as s:
         um = s.get(Message, user_message_id)
-        if um is None or len((um.content or "").strip()) < 8:
+        if um is None or len((um.content or "").strip()) < 8 or _ACK.fullmatch((um.content or "").strip()):
             return {}
         reply = s.query(Message).filter(Message.id > um.id, Message.role == "assistant").order_by(Message.id).first()
         mems = s.query(Memory).order_by(Memory.id).all()

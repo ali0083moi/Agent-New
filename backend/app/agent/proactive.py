@@ -259,6 +259,19 @@ def build(f: Followup) -> tuple[str, str, list[str]] | None:
                         "جواب داده؟ اگه نه، یه ایمیل پیگیری کوتاه برات بنویسم؟")
             return instr, fallback, ["جواب داده", "متن پیگیری رو بنویس", "بیخیالش"]
 
+        if f.kind == "leave":
+            pl = f.payload or {}
+            start = timeutil.parse_datetime(pl["start"])
+            leave = timeutil.parse_datetime(pl["leave_at"])
+            hm = lambda d: timeutil.fa_digits(d.strftime("%H:%M"))  # noqa: E731
+            if pl.get("from_home"):
+                text = (f"🚪 وقت حاضر شدنه: **{pl['title']}** ساعت {hm(start)} در «{pl['place']}».\n"
+                        f"ساعت {hm(leave)} باید از خونه راه بیفتی (مسیر حدود {timeutil.fa_digits(pl['travel'])} دقیقه).")
+            else:
+                text = (f"🚗 ساعت {hm(leave)} از «{pl['origin']}» راه بیفت تا به **{pl['title']}** "
+                        f"(ساعت {hm(start)} در «{pl['place']}») برسی — مسیر حدود {timeutil.fa_digits(pl['travel'])} دقیقه.")
+            return "", text, ["راه افتادم", "امروز نمی‌رم"]
+
         if f.kind == "custom":
             extra = f" Related task: {_task_line(s, t)}." if t else ""
             instr = f"Reminder the user (or you) scheduled: «{f.note}».{extra} Deliver it naturally."
@@ -288,7 +301,8 @@ async def dispatch(fid: int) -> dict[str, Any] | None:
         return None
     instr, fallback, quick = built
     async with core.lock:
-        text = await core.compose(instr, fallback)
+        # an empty instruction means the fixed text is the message (no model call needed)
+        text = await core.compose(instr, fallback) if instr else fallback
         msg = await notify.deliver(text, f.kind, meta={"followup_id": fid, "quick_replies": quick})
     _mark_sent(fid)
     return msg
@@ -308,13 +322,55 @@ def _mark_sent(fid: int) -> None:
     bus.publish("data_changed", ["followups"])
 
 
+# task reminders that fall due together are sent as one message (one model call instead of several)
+BATCHABLE = {"deadline", "task_checkin", "overdue"}
+
+
+async def dispatch_batch(fids: list[int]) -> dict[str, Any] | None:
+    parts: list[tuple[int, str, str]] = []
+    for fid in fids:
+        with session() as s:
+            f = s.get(Followup, fid)
+            if f is None or f.status != "pending":
+                continue
+            s.expunge(f)
+        built = build(f)
+        if built is None:
+            _mark(fid, "cancelled")
+            continue
+        parts.append((fid, built[0], built[1]))
+    if len(parts) == 1:
+        return await dispatch(parts[0][0])
+    if not parts:
+        return None
+    instr = ("Several task reminders are due at the same time. Combine them into ONE short message: a compact "
+             "bullet list, most urgent first, then one line of advice on what to do now.\n"
+             + "\n".join(f"- {p[1]}" for p in parts))
+    fallback = "\n".join(p[2] for p in parts)
+    async with core.lock:
+        text = await core.compose(instr, fallback)
+        msg = await notify.deliver(text, "deadline", meta={"followup_ids": [p[0] for p in parts]})
+    for p in parts:
+        _mark(p[0], "sent")
+    bus.publish("data_changed", ["followups"])
+    return msg
+
+
 async def tick() -> int:
     """One scheduler iteration: generate + send due follow-ups."""
     with session() as s:
         followups.generate(s)
-        ids = [f.id for f in followups.due_now(s)]
+        due = [(f.id, f.kind) for f in followups.due_now(s)]
+    batch = [fid for fid, kind in due if kind in BATCHABLE]
+    singles = [fid for fid, kind in due if kind not in BATCHABLE or len(batch) < 2]
     sent = 0
-    for fid in ids:
+    if len(batch) >= 2:
+        try:
+            if await dispatch_batch(batch):
+                sent += 1
+        except Exception:  # noqa: BLE001
+            log.exception("dispatch of follow-ups %s failed", batch)
+    for fid in singles:
         try:
             if await dispatch(fid):
                 sent += 1

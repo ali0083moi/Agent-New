@@ -42,3 +42,10 @@ def after_turn(user_message_id: int) -> None:
     spawn("facts", lambda: memory.extract_facts(user_message_id))
     spawn("index", memory.index_pending)
     spawn("summary", memory.summarize_old)
+
+
+def session_ended(session_id: int) -> None:
+    """A chat session was closed (new session started): summarize it once, for continuity."""
+    from . import memory
+
+    spawn("session_summary", lambda: memory.summarize_session(session_id))

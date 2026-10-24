@@ -406,15 +406,19 @@ def sweep_missed(s: Session, now: datetime | None = None) -> int:
 
 # ---------------------------------------------------------------- availability
 def check_availability(
-    s: Session, start: datetime, end: datetime, buffer_minutes: int = 0
+    s: Session, start: datetime, end: datetime, buffer_minutes: int = 0,
+    before_minutes: int | None = None, after_minutes: int | None = None,
 ) -> dict[str, Any]:
     """Can the user spend [start, end] on something else (e.g. go out)?
 
-    Looks at hard conflicts AND whether the lost time makes deadlines infeasible.
+    Looks at hard conflicts AND whether the lost time makes deadlines infeasible. The window is widened by the
+    trip there (before_minutes, default buffer_minutes) and back (after_minutes).
     """
     p = prefs.all_prefs(s)
     now = timeutil.now()
-    win = (start - timedelta(minutes=buffer_minutes), end + timedelta(minutes=buffer_minutes))
+    before = buffer_minutes if before_minutes is None else before_minutes
+    after = buffer_minutes if after_minutes is None else after_minutes
+    win = (start - timedelta(minutes=before), end + timedelta(minutes=after))
 
     conflicts = []
     for it in cal.class_occurrences(s, win[0], win[1]):

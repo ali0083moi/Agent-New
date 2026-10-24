@@ -6,7 +6,7 @@ import json
 from datetime import date, datetime, timedelta
 
 import pytest
-from conftest import call
+from conftest import call, sid
 
 from app import (actions, followups, gamify, habits, ielts, insights, memory, outbox, planner, prefs, push, rescue,
                  telegram)
@@ -31,13 +31,13 @@ def ex(_tool, **args):
 def _add_msgs(n, start_text="پیام"):
     with session() as s:
         for i in range(n):
-            s.add(Message(role="user" if i % 2 == 0 else "assistant", content=f"{start_text} شماره {i}", channel="web",
+            s.add(Message(session_id=sid(), role="user" if i % 2 == 0 else "assistant", content=f"{start_text} شماره {i}", channel="web",
                           created_at=datetime(2026, 10, 1, 10) + timedelta(minutes=i)))
 
 
 def test_keyword_recall_finds_old_messages(fake_llm):
     with session() as s:
-        s.add(Message(role="user", content="استاد پایگاه داده گفت پروژه باید با پستگرس باشه", channel="web",
+        s.add(Message(session_id=sid(), role="user", content="استاد پایگاه داده گفت پروژه باید با پستگرس باشه", channel="web",
                       created_at=datetime(2026, 9, 1)))
     _add_msgs(40)
     hits = run(memory.recall("پروژه پایگاه داده رو با چی بنویسم؟"))
@@ -58,8 +58,8 @@ def test_semantic_recall_with_embeddings(fake_llm):
     fake_llm.embed = embed
     memory.reset_cache()
     with session() as s:
-        s.add(Message(role="user", content="من سه‌شنبه‌ها باشگاه می‌رم ساعت ۷ صبح", channel="web", created_at=datetime(2026, 9, 1)))
-        s.add(Message(role="user", content="آیلتس رو برای اپلای کانادا می‌خوام", channel="web", created_at=datetime(2026, 9, 2)))
+        s.add(Message(session_id=sid(), role="user", content="من سه‌شنبه‌ها باشگاه می‌رم ساعت ۷ صبح", channel="web", created_at=datetime(2026, 9, 1)))
+        s.add(Message(session_id=sid(), role="user", content="آیلتس رو برای اپلای کانادا می‌خوام", channel="web", created_at=datetime(2026, 9, 2)))
     _add_msgs(35)
     assert run(memory.index_pending(limit=200)) > 0
     hits = run(memory.recall("برنامه باشگاه من چیه؟"))
@@ -72,18 +72,18 @@ def test_summarize_old(fake_llm):
     assert run(memory.summarize_old()) == 1
     with session() as s:
         sm = s.query(Summary).one()
-        assert sm.start_message_id == 1 and sm.end_message_id == 40
+        assert sm.start_message_id == 1 and sm.end_message_id == memory.SUMMARY_CHUNK
     assert fake_llm.calls[-1]["purpose"] == "summary"
 
 
 def test_extract_facts_adds_updates_and_dedupes(fake_llm):
     with session() as s:
         s.add(Memory(content="در شرکت آلفا کار می‌کند", category="work", source="agent"))
-        u = Message(role="user", content="من دیگه تو آلفا نیستم، رفتم شرکت بتا. ضمناً صبح‌ها قهوه نمی‌خورم", channel="web")
+        u = Message(session_id=sid(), role="user", content="من دیگه تو آلفا نیستم، رفتم شرکت بتا. ضمناً صبح‌ها قهوه نمی‌خورم", channel="web")
         s.add(u)
         s.flush()
         uid = u.id
-        s.add(Message(role="assistant", content="باشه", channel="web"))
+        s.add(Message(session_id=sid(), role="assistant", content="باشه", channel="web"))
     fake_llm.script = [ChatResult(content=json.dumps({
         "add": [{"content": "صبح‌ها قهوه نمی‌خورد", "category": "preference"}, {"content": "در شرکت بتا کار می‌کند"}],
         "update": [{"id": 1, "content": "در شرکت بتا کار می‌کند"}], "delete": []}, ensure_ascii=False))]
@@ -319,7 +319,7 @@ def test_snooze_button_reschedules(clock, fake_llm):
         f = Followup(kind="deadline", due_at=datetime(2026, 10, 19, 9), status="sent", sent_at=datetime(2026, 10, 19, 9))
         s.add(f)
         s.flush()
-        m = Message(role="assistant", content="یادت نره", channel="system", kind="deadline", meta={"followup_id": f.id})
+        m = Message(session_id=sid(), role="assistant", content="یادت نره", channel="system", kind="deadline", meta={"followup_id": f.id})
         s.add(m)
         s.flush()
         mid = m.id

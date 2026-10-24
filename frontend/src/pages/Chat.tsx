@@ -1,8 +1,9 @@
 import { useEffect, useLayoutEffect, useRef, useState, type ClipboardEvent, type DragEvent } from "react";
-import { AlarmClock, BellRing, FileText, Forward, Loader2, Mic, Monitor, Paperclip, Send, Sparkles, Square, Undo2, Volume2, X } from "lucide-react";
+import { AlarmClock, BellRing, FileText, Forward, History, Loader2, MessageSquarePlus, MessagesSquare, Mic, Monitor, Paperclip, Send, Sparkles, Square, Undo2, Volume2, X } from "lucide-react";
 import { api, type ChatMessage } from "../api";
 import { useLive } from "../live";
 import Markdown from "../components/Markdown";
+import { SessionDrawer, SessionList } from "../components/Sessions";
 import { IconButton } from "../components/ui";
 import { cx, faDate, faTime, FOLLOWUP_KIND, isoDate, parseLocal, serverNow } from "../util";
 
@@ -181,7 +182,10 @@ function Bubble({ m, showQuick, onQuick }: { m: ChatMessage; showQuick: boolean;
 }
 
 export default function Chat({ assistantName }: { assistantName: string }) {
-  const { messages, typing, sending, send, hasMore, loadOlder, connected, markRead, toast, draft } = useLive();
+  const { messages, typing, sending, send, hasMore, loadOlder, connected, markRead, toast, draft, sessionId, currentSessionId, newSession, openSession } =
+    useLive();
+  const [drawer, setDrawer] = useState(false);
+  const viewingOld = sessionId !== null && currentSessionId !== null && sessionId !== currentSessionId;
   const [text, setText] = useState("");
   const [files, setFiles] = useState<File[]>([]);
   const [recording, setRecording] = useState(false);
@@ -294,9 +298,21 @@ export default function Chat({ assistantName }: { assistantName: string }) {
   const lastId = messages[messages.length - 1]?.id;
 
   return (
-    <div className="flex h-full min-h-0 flex-col" onDragOver={(e) => { e.preventDefault(); setDragging(true); }} onDragLeave={() => setDragging(false)} onDrop={onDrop}>
+    <div className="flex h-full min-h-0">
+      {/* chat sessions (desktop) */}
+      <aside className="hidden w-64 shrink-0 flex-col border-e border-slate-200/70 lg:flex dark:border-slate-800">
+        <div className="flex items-center gap-2 border-b border-slate-200/70 px-4 py-[1.15rem] text-sm font-bold dark:border-slate-800">
+          <MessagesSquare className="size-4" /> گفتگوها
+        </div>
+        <SessionList />
+      </aside>
+      <SessionDrawer open={drawer} onClose={() => setDrawer(false)} />
+    <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col" onDragOver={(e) => { e.preventDefault(); setDragging(true); }} onDragLeave={() => setDragging(false)} onDrop={onDrop}>
       {/* header */}
       <div className="flex items-center gap-3 border-b border-slate-200/70 px-4 py-3 dark:border-slate-800">
+        <IconButton title="گفتگوها" className="lg:hidden" onClick={() => setDrawer(true)}>
+          <History className="size-5" />
+        </IconButton>
         <div className="relative">
           <div className="flex size-10 items-center justify-center rounded-2xl bg-gradient-to-br from-brand-500 to-fuchsia-500 text-white shadow-[var(--shadow-lift)]">
             <Sparkles className="size-5" />
@@ -309,7 +325,20 @@ export default function Chat({ assistantName }: { assistantName: string }) {
             {typing || sending ? "در حال نوشتن…" : connected ? "آنلاین · همگام با تلگرام" : "در حال اتصال…"}
           </div>
         </div>
+        <IconButton
+          title="گفتگوی جدید"
+          className="ms-auto"
+          onClick={() => newSession().then(() => toast("گفتگوی جدید شروع شد — حافظه بلندمدت سر جاشه", "success")).catch(() => toast("ساخته نشد", "error"))}
+        >
+          <MessageSquarePlus className="size-5" />
+        </IconButton>
       </div>
+      {viewingOld && (
+        <div className="flex flex-wrap items-center gap-2 border-b border-amber-200/70 bg-amber-50 px-4 py-2 text-xs text-amber-800 dark:border-amber-500/20 dark:bg-amber-500/10 dark:text-amber-200">
+          <span>این یک گفتگوی قبلی است. اگر اینجا پیام بدهی، همین گفتگو فعال می‌شود (تلگرام هم ادامه همین را می‌گیرد).</span>
+          <button className="font-semibold underline" onClick={() => openSession(currentSessionId)}>برگشت به گفتگوی فعلی</button>
+        </div>
+      )}
 
       {/* messages */}
       <div
@@ -462,6 +491,7 @@ export default function Chat({ assistantName }: { assistantName: string }) {
           )}
         </div>
       </div>
+    </div>
     </div>
   );
 }

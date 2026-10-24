@@ -82,13 +82,74 @@ async def _tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
 
 # ---------------------------------------------------------------- chat
 @router.get("/messages")
-def messages(before_id: int | None = None, limit: int = 60):
+def messages(before_id: int | None = None, limit: int = 60, session_id: int | None = None):
+    from .. import sessions
+
     with session() as s:
-        q = s.query(Message)
+        sid = session_id or sessions.current_id(s)
+        q = s.query(Message).filter(Message.session_id == sid)
         if before_id:
             q = q.filter(Message.id < before_id)
         rows = q.order_by(Message.id.desc()).limit(min(limit, 200)).all()
-        return {"messages": [serialize.message(m) for m in reversed(rows)]}
+        return {"session_id": sid, "messages": [serialize.message(m) for m in reversed(rows)]}
+
+
+# ---------------------------------------------------------------- chat sessions
+class SessionBody(BaseModel):
+    title: str | None = None
+
+
+@router.get("/sessions")
+def list_sessions():
+    from .. import sessions
+
+    with session() as s:
+        return {"sessions": sessions.listing(s), "current": sessions.current_id(s)}
+
+
+@router.post("/sessions")
+def create_session(body: SessionBody | None = None):
+    from .. import jobs, sessions
+
+    with session() as s:
+        cs, ended = sessions.new_session(s, (body.title or "").strip() if body else "")
+        data = sessions.to_dict(cs, 0, True)
+    if ended is not None:
+        jobs.session_ended(ended)
+    return data
+
+
+@router.patch("/sessions/{session_id}")
+def rename_session(session_id: int, body: SessionBody):
+    from .. import sessions
+    from ..db import ChatSession
+
+    with session() as s:
+        cs = s.get(ChatSession, session_id)
+        if cs is None:
+            raise HTTPException(404, "گفتگو پیدا نشد")
+        cs.title = sessions.title_from(body.title or "")
+        return sessions.to_dict(cs, 0, cs.id == sessions.current_id(s))
+
+
+@router.post("/sessions/{session_id}/activate")
+def activate_session(session_id: int):
+    from .. import sessions
+
+    with session() as s:
+        cs = sessions.activate(s, session_id)
+        if cs is None:
+            raise HTTPException(404, "گفتگو پیدا نشد")
+        return {"current": cs.id}
+
+
+@router.delete("/sessions/{session_id}")
+def delete_session(session_id: int):
+    from .. import sessions
+
+    with session() as s:
+        sessions.delete(s, session_id)
+        return {"ok": True, "current": sessions.current_id(s)}
 
 
 @router.post("/chat")
@@ -96,6 +157,7 @@ async def chat(
     background: BackgroundTasks,
     text: str = Form(""),
     files: list[UploadFile] = File(default=[]),
+    session_id: int | None = Form(None),
 ):
     attachments = []
     for f in files:
@@ -115,7 +177,7 @@ async def chat(
         attachments.append(core.Attachment(kind, data, mime, f.filename or ""))
     if not text.strip() and not attachments:
         raise HTTPException(400, "پیام خالی است")
-    user_msg, reply = await core.handle_user_message(text, "web", attachments)
+    user_msg, reply = await core.handle_user_message(text, "web", attachments, session_id=session_id)
     background.add_task(notify.mirror_web_turn, user_msg["content"] or "📎", reply)
     return {"user": user_msg, "assistant": reply}
 
@@ -801,3 +863,111 @@ async def run_followups_now():
     from ..agent import proactive
 
     return {"sent": await proactive.tick()}
+
+
+# ---------------------------------------------------------------- places & travel
+class PlaceBody(BaseModel):
+    name: str | None = None
+    kind: str | None = None
+    aliases: list[str] | None = None
+    address: str | None = None
+
+
+class TravelBody(BaseModel):
+    from_id: int
+    to_id: int
+    minutes: int
+    mode: str = ""
+    both_ways: bool = True
+
+
+@router.get("/places")
+def list_places():
+    from .. import places
+    from ..db import Place
+
+    with session() as s:
+        prep, known = places.prep_minutes(s)
+        return {"places": [places.place_dict(s, p) for p in s.query(Place).order_by(Place.id)],
+                "travel": places.travel_rows(s), "prep_minutes": prep, "prep_known": known,
+                "kinds": places.KIND_FA, "gaps": places.profile_gaps(s)}
+
+
+@router.post("/places")
+def create_place(body: PlaceBody):
+    from .. import places
+    from ..db import Place
+
+    if not (body.name or "").strip():
+        raise HTTPException(400, "اسم مکان لازم است")
+    with session() as s:
+        p = Place(name=body.name.strip(), kind=body.kind or "other", aliases=body.aliases or [], address=body.address or "")
+        s.add(p)
+        s.flush()
+        planner.invalidate(s)
+        data = places.place_dict(s, p)
+    bus.publish("data_changed", ["places", "schedule"])
+    return data
+
+
+@router.patch("/places/{place_id}")
+def update_place(place_id: int, body: PlaceBody):
+    from .. import places
+    from ..db import Place
+
+    with session() as s:
+        p = s.get(Place, place_id)
+        if p is None:
+            raise HTTPException(404, "مکان پیدا نشد")
+        for key in ("name", "kind", "aliases", "address"):
+            v = getattr(body, key)
+            if v is not None:
+                setattr(p, key, v.strip() if isinstance(v, str) else v)
+        planner.invalidate(s)
+        data = places.place_dict(s, p)
+    bus.publish("data_changed", ["places", "schedule"])
+    return data
+
+
+@router.delete("/places/{place_id}")
+def delete_place(place_id: int):
+    from ..db import Place
+
+    with session() as s:
+        p = s.get(Place, place_id)
+        if p is not None:
+            s.delete(p)
+        planner.invalidate(s)
+    bus.publish("data_changed", ["places", "schedule"])
+    return {"ok": True}
+
+
+@router.put("/travel")
+def set_travel(body: TravelBody):
+    from .. import places
+    from ..db import Place
+
+    with session() as s:
+        a, b = s.get(Place, body.from_id), s.get(Place, body.to_id)
+        if a is None or b is None or a.id == b.id:
+            raise HTTPException(400, "دو مکان متفاوت انتخاب کن")
+        places.set_travel(s, a, b, max(0, int(body.minutes)), body.mode, body.both_ways)
+        planner.invalidate(s)
+        rows = places.travel_rows(s)
+    bus.publish("data_changed", ["places", "schedule"])
+    return {"travel": rows}
+
+
+@router.delete("/travel/{travel_id}")
+def delete_travel(travel_id: int):
+    from ..db import TravelTime
+
+    with session() as s:
+        r = s.get(TravelTime, travel_id)
+        if r is not None:
+            s.query(TravelTime).filter(TravelTime.from_place_id == r.to_place_id,
+                                       TravelTime.to_place_id == r.from_place_id, TravelTime.minutes == r.minutes).delete()
+            s.delete(r)
+        planner.invalidate(s)
+    bus.publish("data_changed", ["places", "schedule"])
+    return {"ok": True}

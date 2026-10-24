@@ -2,6 +2,7 @@ import { useEffect, useState, type ReactNode } from "react";
 import { Bell, Bot, Brain, CalendarRange, Copy, GraduationCap, Link2Off, Moon, Send, Sparkles, Trash2, UserRound, Wallet, Zap } from "lucide-react";
 import { api, type Memory, type SettingsData, type Usage } from "../api";
 import { JalaliInput } from "../components/JalaliPicker";
+import { PlacesCard } from "../components/Places";
 import { currentSubscription, disablePush, enablePush, pushSupported } from "../pwa";
 import { useData, useLive } from "../live";
 import { Badge, Button, Card, Input, Segmented, Select, Spinner, Toggle } from "../components/ui";
@@ -156,7 +157,13 @@ export default function Settings({ theme, setTheme }: { theme: string; setTheme:
         <Row label="ساعت خواب">{time("sleep_time")}</Row>
         <Row label="شروع بازه کاری" hint="برنامه‌ریز، کارها را در این بازه می‌چیند">{time("work_start")}</Row>
         <Row label="پایان بازه کاری">{time("work_end")}</Row>
+        <Row label="زمان حاضر شدن قبل از بیرون رفتن (دقیقه)" hint="به زمان مسیر اضافه می‌شود">{num("prep_minutes")}</Row>
+        <Row label="یادآوری «وقت حاضر شدن / راه افتادن»" hint="برای کلاس‌ها و قرارهایی که مکان و زمان مسیرشان معلوم است">
+          <Toggle checked={Boolean(p.leave_reminders)} onChange={(v) => save("leave_reminders", v)} />
+        </Row>
       </Card>
+
+      <PlacesCard />
 
       <Card title="پیگیری‌ها" icon={<Zap className="size-4 text-amber-500" />}>
         <Row label="شدت پیگیری" hint="تعداد یادآوری‌ها و احوال‌پرسی‌ها">
@@ -191,6 +198,9 @@ export default function Settings({ theme, setTheme }: { theme: string; setTheme:
         <Row label="حالت نجات" hint="وقتی با حجم کار به ددلاین‌ها نمی‌رسی خودم پیشنهاد راه‌حل بدهم">
           <Toggle checked={Boolean(p.rescue_mode)} onChange={(v) => save("rescue_mode", v)} />
         </Row>
+        <Row label="گفتگوی جدید خودکار" hint="بعد از چند ساعت بی‌پیامی، تاریخچه چت از نو شروع شود (۰ = هرگز). حافظه بلندمدت می‌ماند و هزینه هر پیام کم می‌ماند">
+          {num("session_idle_hours")}
+        </Row>
         <Row label="یادآوری‌های تطبیقی" hint="یادآوری‌ها را از ساعت‌هایی که معمولاً جواب نمی‌دهی جابه‌جا کنم">
           <Toggle checked={Boolean(p.adaptive_reminders)} onChange={(v) => save("adaptive_reminders", v)} />
         </Row>
@@ -201,7 +211,7 @@ export default function Settings({ theme, setTheme }: { theme: string; setTheme:
         <Row label="حداکثر کار متمرکز در روز (دقیقه)">{num("max_focus_minutes_per_day")}</Row>
         <Row label="طول هر بلوک کاری (دقیقه)">{num("focus_block_minutes")}</Row>
         <Row label="استراحت بین بلوک‌ها (دقیقه)">{num("break_minutes")}</Row>
-        <Row label="زمان رفت‌وآمد قبل/بعد کلاس (دقیقه)">{num("class_buffer_minutes")}</Row>
+        <Row label="زمان رفت‌وآمد پیش‌فرض قبل/بعد کلاس (دقیقه)" hint="فقط وقتی مکان کلاس زمان مسیر ثبت‌شده ندارد">{num("class_buffer_minutes")}</Row>
         <Row label="برنامه‌ریزی دوباره خودکار" hint="وقتی کاری اضافه/عوض شد یا بلوکی از دست رفت">
           <Toggle checked={Boolean(p.auto_replan)} onChange={(v) => save("auto_replan", v)} />
         </Row>

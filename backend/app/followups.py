@@ -14,7 +14,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from . import cal, insights, planner, prefs, stats, timeutil
-from .db import Contact, Followup, Habit, HabitLog, Message, PlannedBlock, RecurringEvent, Task, VocabWord
+from .db import Contact, Event, Followup, Habit, HabitLog, Message, PlannedBlock, RecurringEvent, Task, VocabWord
 
 log = logging.getLogger(__name__)
 
@@ -27,6 +27,7 @@ IDLE_MAX_PER_DAY = {"low": 1, "normal": 2, "high": 4}
 
 # how late a follow-up may still be sent before it is considered stale
 MAX_DELAY = {
+    "leave": timedelta(minutes=20),
     "block_start": timedelta(minutes=30),
     "block_end": timedelta(hours=2),
     "post_class": timedelta(hours=14),
@@ -215,14 +216,47 @@ def generate(s: Session, now: datetime | None = None) -> int:
         feas = planner.feasibility(s, start=now)
         if feas.at_risk:
             ids = "-".join(str(t["task_id"]) for t in sorted(feas.at_risk, key=lambda x: x["task_id"]))
-            if _ensure(s, f"rescue:{now.date().isoformat()}:{ids}", "rescue", now, payload={"task_ids": ids}):
+            # at most one rescue message a day (the at-risk set changes with every task added)
+            if _ensure(s, f"rescue:{now.date().isoformat()}", "rescue", now, payload={"task_ids": ids}):
                 n += 1
+
+    # 8) time to get ready / leave for appointments somewhere else (known place + travel time)
+    if p.get("leave_reminders", True):
+        n += _leave_reminders(s, now)
 
     # 6) a focus timer that has been running for very long (forgot to stop?)
     cur = stats.active_focus(s)
     if cur is not None and now - cur.start_at >= timedelta(hours=3):
         if _ensure(s, f"focus_long:{cur.id}", "focus_long", now, payload={"log_id": cur.id}):
             n += 1
+    return n
+
+
+def _leave_reminders(s: Session, now: datetime) -> int:
+    from . import places
+
+    n = 0
+    for day in (now.date(), now.date() + timedelta(days=1)):
+        start, end = timeutil.at(day, "00:00"), timeutil.at(day + timedelta(days=1), "00:00")
+        items = []
+        for it in cal.class_occurrences(s, start, end):
+            loc = (it.meta or {}).get("location") or ""
+            items.append(places.Located(it.start, it.end, it.title, places.resolve(s, loc) if loc else None))
+        for ev in s.query(Event).filter(Event.start_at >= start, Event.start_at < end, Event.location != "").all():
+            items.append(places.Located(ev.start_at, ev.end_at, ev.title, places.resolve(s, ev.location)))
+        prep, _ = places.prep_minutes(s)
+        for it, trip in zip(items, places.plan_trips(s, items)):
+            if trip is None or trip.leave_at is None:
+                continue
+            due = trip.prep_from or trip.leave_at
+            if due < now - timedelta(minutes=10) or due > now + timedelta(hours=36):
+                continue
+            payload = {"title": it.title, "start": timeutil.iso(it.start), "place": it.place.name,
+                       "leave_at": timeutil.iso(trip.leave_at), "travel": trip.before - (prep if trip.prep_from else 0),
+                       "origin": trip.origin.name if trip.origin else "", "from_home": trip.prep_from is not None,
+                       "prep": prep if trip.prep_from else 0}
+            if _ensure(s, f"leave:{it.place.id}:{timeutil.iso(it.start)}", "leave", due, payload=payload):
+                n += 1
     return n
 
 
@@ -356,7 +390,7 @@ def due_now(s: Session, now: datetime | None = None) -> list[Followup]:
         if not _still_valid(s, f, now):
             f.status = "cancelled"
             continue
-        if f.kind != "custom" and is_quiet(now, p):
+        if f.kind not in ("custom", "leave") and is_quiet(now, p):
             if f.kind in ("block_start", "block_end", "idle_checkin", "focus_long", "daily_review"):
                 f.status = "cancelled"
             else:

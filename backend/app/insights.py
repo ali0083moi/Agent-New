@@ -83,6 +83,64 @@ def estimation_lines(factors: dict[str, Any]) -> list[str]:
     return lines
 
 
+# ---------------------------------------------------------------- how long things actually take
+_WORD_SPLIT = str.maketrans({c: " " for c in "،,.:;!?()[]«»\"'-_/"})
+_STOPWORDS = {"و", "به", "از", "برای", "با", "در", "رو", "را", "که", "این", "اون", "یه", "یک", "تا", "the", "a", "to", "for"}
+
+
+def _words(text: str) -> set[str]:
+    t = timeutil.to_latin_digits((text or "").lower()).replace("\u200c", " ").translate(_WORD_SPLIT)
+    return {w for w in t.split() if len(w) > 1 and w not in _STOPWORDS and not w.isdigit()}
+
+
+def _finished_with_time(s: Session, days: int = 180) -> list[tuple[Task, int]]:
+    since = timeutil.now() - timedelta(days=days)
+    done = s.query(Task).filter(Task.status == "done", Task.completed_at >= since, Task.parent_id.is_(None)).all()
+    spent = _spent_by_task(s, [t.id for t in done])
+    return [(t, spent[t.id]) for t in done if spent.get(t.id, 0) >= 10]
+
+
+def similar_durations(s: Session, title: str, category: str | None = None, k: int = 3) -> list[dict[str, Any]]:
+    """Finished tasks that look like `title`, with the time they really took."""
+    q = _words(title)
+    if not q:
+        return []
+    scored = []
+    for t, spent in _finished_with_time(s):
+        overlap = len(q & _words(t.title))
+        if overlap and overlap / len(q) >= 0.4:
+            scored.append((overlap + (0.5 if category and t.category == category else 0), t, spent))
+    scored.sort(key=lambda x: -x[0])
+    return [{"title": t.title, "minutes": spent} for _, t, spent in scored[:k]]
+
+
+def typical_minutes(s: Session) -> dict[str, dict[str, int]]:
+    """Median real time per finished task, by category (at least MIN_SAMPLES tasks)."""
+    by_cat: dict[str, list[int]] = defaultdict(list)
+    for t, spent in _finished_with_time(s):
+        by_cat[t.category].append(spent)
+    return {c: {"minutes": int(statistics.median(v)), "samples": len(v)} for c, v in by_cat.items() if len(v) >= MIN_SAMPLES}
+
+
+def suggest_minutes(s: Session, title: str, category: str) -> tuple[int, str] | None:
+    """An estimate learned from history: similar past tasks first, then the category's typical time."""
+    sim = similar_durations(s, title, category)
+    if sim:
+        return int(statistics.median(x["minutes"] for x in sim)), f"similar past tasks took {', '.join(str(x['minutes']) for x in sim)} min"
+    typ = typical_minutes(s).get(category)
+    if typ:
+        return typ["minutes"], f"typical {category} task took {typ['minutes']} min (n={typ['samples']})"
+    return None
+
+
+def duration_lines(s: Session) -> list[str]:
+    typ = typical_minutes(s)
+    if not typ:
+        return []
+    return ["typical real time per finished task: " + ", ".join(
+        f"{cal.CATEGORY_FA.get(c, c)} ~{v['minutes']}m (n={v['samples']})" for c, v in typ.items())]
+
+
 # ---------------------------------------------------------------- productive hours
 def hour_profile(s: Session, days: int = 42) -> list[int]:
     """Productive minutes per hour of day (0..23), spreading each log over the hours it covers."""

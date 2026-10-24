@@ -1,7 +1,7 @@
 import asyncio
 from datetime import datetime
 
-from conftest import call
+from conftest import call, sid
 
 from app import followups, prefs
 from app.agent import core, proactive
@@ -65,7 +65,7 @@ def test_homework_flow_through_agent(clock, fake_llm):
         assert {"deadline", "overdue"} <= kinds
     # the system prompt carried the class & the tool definitions
     first = fake_llm.calls[0]
-    assert "کلاس زبان" in first["messages"][0]["content"]
+    assert "کلاس زبان" in first["messages"][1]["content"]  # [0] static persona, [1] live context
     assert any(tl["function"]["name"] == "add_task" for tl in first["tools"])
     # second LLM call saw the tool result
     assert fake_llm.calls[1]["messages"][-1]["role"] == "tool"
@@ -188,7 +188,7 @@ def test_block_nudges_and_focus(clock, fake_llm):
 def test_idle_checkin(clock, fake_llm):
     prefs.set("idle_checkin_hours", 2)
     with session() as s:
-        s.add(Message(role="user", content="سلام", channel="web", created_at=datetime(2026, 10, 19, 7, 0)))
+        s.add(Message(session_id=sid(), role="user", content="سلام", channel="web", created_at=datetime(2026, 10, 19, 7, 0)))
     clock.value = datetime(2026, 10, 19, 11, 0)
     with session() as s:
         followups.generate(s)
@@ -245,9 +245,9 @@ def test_changing_brief_time_replaces_pending_brief(clock):
 
 def test_history_roles_alternate(fake_llm):
     with session() as s:
-        s.add(Message(role="user", content="سلام", channel="web"))
-        s.add(Message(role="assistant", content="یادآوری ۱", channel="system", kind="deadline"))
-        s.add(Message(role="assistant", content="یادآوری ۲", channel="system", kind="idle_checkin"))
+        s.add(Message(session_id=sid(), role="user", content="سلام", channel="web"))
+        s.add(Message(session_id=sid(), role="assistant", content="یادآوری ۱", channel="system", kind="deadline"))
+        s.add(Message(session_id=sid(), role="assistant", content="یادآوری ۲", channel="system", kind="idle_checkin"))
     hist = core._history_messages()
     assert [m["role"] for m in hist] == ["user", "assistant"]
     assert "یادآوری ۱" in hist[1]["content"] and "یادآوری ۲" in hist[1]["content"]

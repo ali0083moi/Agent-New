@@ -2,6 +2,7 @@ export type Action = { label: string; ok: boolean; tool: string };
 
 export type ChatMessage = {
   id: number;
+  session_id: number | null;
   role: "user" | "assistant";
   content: string;
   channel: "web" | "telegram" | "system";
@@ -47,6 +48,46 @@ export type Task = {
   subtasks_total?: number;
   subtasks_done?: number;
   completed_at: string | null;
+};
+
+export type ChatSessionInfo = {
+  id: number;
+  title: string;
+  created_at: string;
+  last_message_at: string | null;
+  messages: number;
+  current: boolean;
+  has_summary: boolean;
+};
+
+export type Place = {
+  id: number;
+  name: string;
+  aliases: string[];
+  kind: string;
+  address: string;
+  from_home_minutes: number | null;
+};
+
+export type TravelRow = {
+  id: number;
+  from: string;
+  to: string;
+  from_id: number;
+  to_id: number;
+  minutes: number;
+  mode: string;
+  both_ways: boolean;
+  samples: number;
+};
+
+export type PlacesData = {
+  places: Place[];
+  travel: TravelRow[];
+  prep_minutes: number;
+  prep_known: boolean;
+  kinds: Record<string, string>;
+  gaps: string[];
 };
 
 export type Project = {
@@ -344,5 +385,6 @@ export const api = {
   get: <T>(url: string) => request<T>("GET", url),
   post: <T>(url: string, body?: unknown) => request<T>("POST", url, body ?? {}),
   patch: <T>(url: string, body: unknown) => request<T>("PATCH", url, body),
+  put: <T>(url: string, body: unknown) => request<T>("PUT", url, body),
   del: <T>(url: string) => request<T>("DELETE", url),
 };

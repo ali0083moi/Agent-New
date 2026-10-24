@@ -7,6 +7,12 @@ export type Draft = { turn_id: string; text: string; status?: string };
 
 type LiveCtx = {
   draft: Draft | null;
+  /** the chat session shown in the chat page (null until the first load) */
+  sessionId: number | null;
+  /** the session web + Telegram are currently writing into */
+  currentSessionId: number | null;
+  openSession: (id: number | null) => Promise<void>;
+  newSession: () => Promise<void>;
   messages: ChatMessage[];
   hasMore: boolean;
   loadOlder: () => Promise<void>;
@@ -41,8 +47,15 @@ export function LiveProvider({ children, activePage }: { children: ReactNode; ac
   const [version, setVersion] = useState<Record<string, number>>({});
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [unread, setUnread] = useState(0);
+  const [sessionId, setSessionId] = useState<number | null>(null);
+  const [currentSessionId, setCurrentSessionId] = useState<number | null>(null);
   const pageRef = useRef(activePage);
   pageRef.current = activePage;
+  // refs so the long-lived SSE handler sees the latest values
+  const viewRef = useRef<number | null>(null);
+  const currentRef = useRef<number | null>(null);
+  viewRef.current = sessionId;
+  currentRef.current = currentSessionId;
 
   const toast = useCallback((text: string, tone: Toast["tone"] = "info") => {
     const id = Date.now() + Math.random();
@@ -58,11 +71,33 @@ export function LiveProvider({ children, activePage }: { children: ReactNode; ac
     });
   }, []);
 
-  const refresh = useCallback(async () => {
-    const data = await api.get<{ messages: ChatMessage[] }>("/api/messages?limit=60");
-    setMessages((prev) => merge(prev, data.messages));
+  /** Load a session's latest messages (null = the current session). Replaces the list when switching sessions. */
+  const load = useCallback(async (id: number | null, replace: boolean) => {
+    const data = await api.get<{ session_id: number; messages: ChatMessage[] }>(
+      `/api/messages?limit=60${id ? `&session_id=${id}` : ""}`,
+    );
+    if (id === null) setCurrentSessionId(data.session_id);
+    setSessionId(data.session_id);
+    setMessages((prev) => (replace ? data.messages : merge(prev, data.messages)));
     setHasMore(data.messages.length >= 60);
   }, []);
+
+  const refresh = useCallback(() => load(viewRef.current, false), [load]);
+
+  const openSession = useCallback(
+    async (id: number | null) => {
+      setDraft(null);
+      await load(id, true);
+    },
+    [load],
+  );
+
+  const newSession = useCallback(async () => {
+    const cs = await api.post<{ id: number }>("/api/sessions", {});
+    setCurrentSessionId(cs.id);
+    await load(cs.id, true);
+    bump("sessions");
+  }, [load, bump]);
 
   useEffect(() => {
     refresh().catch(() => undefined);
@@ -80,7 +115,20 @@ export function LiveProvider({ children, activePage }: { children: ReactNode; ac
         try {
           const { event, data } = JSON.parse(ev.data);
           if (event === "message") {
-            setMessages((prev) => merge(prev, [data as ChatMessage]));
+            const m = data as ChatMessage;
+            const viewing = viewRef.current;
+            if (m.session_id !== viewing) {
+              // a new session started (idle rollover / Telegram /new): follow it if we were looking at the current one
+              if (viewing !== null && viewing === currentRef.current && m.session_id !== null) {
+                setCurrentSessionId(m.session_id);
+                load(m.session_id, true).catch(() => undefined);
+              }
+              bump("sessions");
+              if (m.role === "assistant" && pageRef.current !== "chat") setUnread((u) => u + 1);
+              return;
+            }
+            setMessages((prev) => merge(prev, [m]));
+            bump("sessions");
             if (data.role === "assistant" && data.meta?.turn_id) setDraft((d) => (d && d.turn_id === data.meta.turn_id ? null : d));
             if (data.role === "assistant" && pageRef.current !== "chat") setUnread((u) => u + 1);
             if (data.role === "assistant") bump("messages");
@@ -95,6 +143,14 @@ export function LiveProvider({ children, activePage }: { children: ReactNode; ac
             }));
           } else if (event === "data_changed") {
             bump(...(data as string[]));
+          } else if (event === "sessions") {
+            const cur = (data as { current?: number }).current;
+            if (cur && cur !== currentRef.current) {
+              const follow = viewRef.current === null || viewRef.current === currentRef.current;
+              setCurrentSessionId(cur);
+              if (follow) load(cur, true).catch(() => undefined);
+            }
+            bump("sessions");
           }
         } catch {
           /* ignore */
@@ -103,25 +159,30 @@ export function LiveProvider({ children, activePage }: { children: ReactNode; ac
     };
     open();
     return () => es?.close();
-  }, [refresh, bump]);
+  }, [refresh, bump, load]);
 
   const loadOlder = useCallback(async () => {
     const first = messages[0];
     if (!first) return;
-    const data = await api.get<{ messages: ChatMessage[] }>(`/api/messages?before_id=${first.id}&limit=60`);
+    const data = await api.get<{ messages: ChatMessage[] }>(
+      `/api/messages?before_id=${first.id}&limit=60${sessionId ? `&session_id=${sessionId}` : ""}`,
+    );
     setMessages((prev) => merge(data.messages, prev));
     setHasMore(data.messages.length >= 60);
-  }, [messages]);
+  }, [messages, sessionId]);
 
   const send = useCallback(
     async (text: string, files: File[] = []) => {
       const fd = new FormData();
       fd.append("text", text);
+      if (viewRef.current) fd.append("session_id", String(viewRef.current));
       for (const f of files) fd.append("files", f, f.name);
       setSending(true);
       try {
         const res = await api.post<{ user: ChatMessage; assistant: ChatMessage }>("/api/chat", fd);
         setMessages((prev) => merge(prev, [res.user, res.assistant]));
+        if (res.user.session_id) setCurrentSessionId(res.user.session_id);
+        bump("sessions");
       } catch (e) {
         toast((e as Error).message || "ارسال نشد", "error");
         throw e;
@@ -129,12 +190,16 @@ export function LiveProvider({ children, activePage }: { children: ReactNode; ac
         setSending(false);
       }
     },
-    [toast],
+    [toast, bump],
   );
 
   const value = useMemo<LiveCtx>(
     () => ({
       draft,
+      sessionId,
+      currentSessionId,
+      openSession,
+      newSession,
       messages,
       hasMore,
       loadOlder,
@@ -149,7 +214,8 @@ export function LiveProvider({ children, activePage }: { children: ReactNode; ac
       unread,
       markRead: () => setUnread(0),
     }),
-    [draft, messages, hasMore, loadOlder, typing, sending, send, version, bump, connected, toast, toasts, unread],
+    [draft, sessionId, currentSessionId, openSession, newSession, messages, hasMore, loadOlder, typing, sending, send,
+      version, bump, connected, toast, toasts, unread],
   );
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }

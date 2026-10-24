@@ -217,17 +217,37 @@ def busy_intervals(
     class_buffer: int | None = None,
     exclude_event_ids: set[int] | None = None,
 ) -> list[tuple[datetime, datetime, str]]:
-    """Hard commitments (classes with travel buffer, events), optionally planned blocks."""
+    """Hard commitments (classes, events) including the time to get there and back, optionally planned blocks.
+
+    Items at a known place get getting-ready + travel time (see places.py); other classes get `class_buffer`
+    minutes on each side. class_buffer=0 means the raw appointment times without any travel."""
+    from . import places
+
+    raw = class_buffer == 0
     if class_buffer is None:
         class_buffer = int(prefs.get("class_buffer_minutes", s=s) or 0)
     buf = timedelta(minutes=class_buffer)
-    out: list[tuple[datetime, datetime, str]] = []
-    for it in class_occurrences(s, start - buf, end + buf):
-        out.append((it.start - buf, it.end + buf, it.title))
-    for ev in s.query(Event).filter(Event.end_at > start, Event.start_at < end).all():
+    pad = timedelta(hours=4)  # trips can start a few hours before the window
+    items: list[tuple[places.Located, bool]] = []
+    for it in class_occurrences(s, start - pad, end + pad):
+        loc = (it.meta or {}).get("location") or ""
+        items.append((places.Located(it.start, it.end, it.title, places.resolve(s, loc) if loc and not raw else None), True))
+    for ev in s.query(Event).filter(Event.end_at > start - pad, Event.start_at < end + pad).all():
         if exclude_event_ids and ev.id in exclude_event_ids:
             continue
-        out.append((ev.start_at, ev.end_at, ev.title))
+        pl = places.resolve(s, ev.location) if ev.location and not raw else None
+        items.append((places.Located(ev.start_at, ev.end_at, ev.title, pl), False))
+    trips = places.plan_trips(s, [x for x, _ in items]) if not raw else [None] * len(items)
+    out: list[tuple[datetime, datetime, str]] = []
+    for (it, is_class), trip in zip(items, trips):
+        if trip is not None:
+            a, b = it.start - timedelta(minutes=trip.before), it.end + timedelta(minutes=trip.after)
+        elif is_class:
+            a, b = it.start - buf, it.end + buf
+        else:
+            a, b = it.start, it.end
+        if b > start and a < end:
+            out.append((a, b, it.title))
     if include_blocks:
         for b in (
             s.query(PlannedBlock)

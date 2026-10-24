@@ -3,6 +3,7 @@ name: Ops
 # Manual maintenance tasks on the server (Actions → Ops → Run workflow). Uses the same DEPLOY_* secrets as the
 # deploy. This repository is public, so these tasks only print numbers and synthetic test results, never user data.
 #   usage  — LLM calls, tokens and cost by purpose and model (python -m app.usage_report)
+#   connectivity — can the server reach OSM routing, Google Calendar and Gmail
 #   evals  — compare models on the built-in test scenarios with the server's GapGPT key (python -m app.evals)
 
 on:
@@ -11,7 +12,7 @@ on:
       task:
         description: What to run
         type: choice
-        options: [usage, evals]
+        options: [usage, evals, connectivity]
         default: usage
       models:
         description: "evals: comma-separated model ids"
@@ -56,6 +57,8 @@ jobs:
           case "$TASK" in
             usage)
               "${ssh[@]}" "$target" "docker exec peygir python -m app.usage_report --days $DAYS" ;;
+            connectivity)
+              "${ssh[@]}" "$target" "docker exec peygir python -m app.connectivity" ;;
             evals)
               args="--models $MODELS --out /tmp/evals-report.md"
               [ -n "$SCENARIOS" ] && args="$args --scenarios $SCENARIOS"

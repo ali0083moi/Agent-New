@@ -648,9 +648,18 @@ def _describe(s: Session, name: str, args: dict[str, Any]) -> str:
     for key in ("title", "task", "event", "name", "university", "project", "contact", "description"):
         if args.get(key) and not bits:
             bits.append(f"«{args[key]}»")
-    for key in ("due", "start", "status", "at"):
-        if args.get(key):
-            bits.append(f"{key}={args[key]}")
+    status_fa = {"done": "انجام‌شده", "cancelled": "لغو", "todo": "باز", "doing": "در حال انجام"}
+    for key, word in (("due", "ددلاین"), ("start", "زمان"), ("at", "زمان"), ("status", "وضعیت")):
+        value = args.get(key)
+        if not value:
+            continue
+        if key == "status":
+            bits.append(f"← {word}: {status_fa.get(str(value), value)}")
+            continue
+        try:
+            bits.append(f"← {word}: {timeutil.fa_datetime(timeutil.parse_datetime(str(value)))}")
+        except ValueError:
+            bits.append(f"← {word}: {value}")
     return (label + (" " + " ".join(bits) if bits else "")).strip()
 
 

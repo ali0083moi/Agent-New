@@ -168,7 +168,7 @@ async def resolve(message_id: int, approve: bool, channel: str = "web") -> dict[
         ok = "error" not in result and not result.get("needs_confirmation")
         _close([pid], "approved" if ok else "failed", result)
         logs.append(core._action_log(name, args, result))
-        (done if ok else failed).append(what if ok else f"{what} ({result.get('error', '')})")
+        (done if ok else failed).append(what)
     tools.finalize(ctx)
     if ctx.changed:
         bus.publish("data_changed", sorted(ctx.changed))
@@ -177,6 +177,8 @@ async def resolve(message_id: int, approve: bool, channel: str = "web") -> dict[
     notify.update_meta(message_id, confirm=_confirm_state(message_id, "approved" if done else "failed"),
                        undoable=bool(ctx.turn_id and journal.has_changes(ctx.turn_id)))
     lines = [f"✅ انجام شد: {x}" for x in done] + [f"⚠️ نشد: {x}" for x in failed]
+    if failed:
+        lines.append("(احتمالاً این مورد در این فاصله حذف یا عوض شده — بگو تا دوباره بررسی کنم.)")
     msg = notify.store_message(
         "assistant", "\n".join(lines), channel if channel != "web" else "system", kind="chat",
         meta={"action_log": ["after the user pressed ✅: " + "; ".join(logs)], "reply_to": message_id,

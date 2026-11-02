@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState, type ClipboardEvent, type DragEvent } from "react";
-import { AlarmClock, BellRing, FileText, Forward, History, Loader2, MessageSquarePlus, MessagesSquare, Mic, Monitor, Paperclip, Send, Sparkles, Square, Undo2, Volume2, X } from "lucide-react";
+import { AlarmClock, BellRing, Check, FileText, Forward, History, Loader2, MessageSquarePlus, MessagesSquare, Mic, Monitor, Paperclip, Send, Sparkles, Square, Undo2, Volume2, X } from "lucide-react";
 import { api, type ChatMessage } from "../api";
 import { useLive } from "../live";
 import Markdown from "../components/Markdown";
@@ -103,6 +103,55 @@ function MessageTools({ m }: { m: ChatMessage }) {
   );
 }
 
+function ConfirmCard({ m }: { m: ChatMessage }) {
+  const { toast } = useLive();
+  const [busy, setBusy] = useState<"y" | "n" | null>(null);
+  const c = m.meta?.confirm;
+  if (!c) return null;
+  const answer = async (yes: boolean) => {
+    setBusy(yes ? "y" : "n");
+    try {
+      const r = await api.post<{ ok: boolean; text: string }>(`/api/messages/${m.id}/${yes ? "approve" : "reject"}`);
+      if (!r.ok) toast(r.text, "error");
+    } catch (e) {
+      toast((e as Error).message, "error");
+    } finally {
+      setBusy(null);
+    }
+  };
+  const done: Record<string, string> = { approved: "✅ انجام شد", rejected: "❌ انجام نشد", expired: "منقضی شد", failed: "⚠️ انجام نشد" };
+  return (
+    <div className="w-full min-w-[15rem] rounded-2xl border border-brand-200 bg-brand-50/60 p-3 text-sm dark:border-brand-500/30 dark:bg-brand-500/10">
+      {c.summary && <div className="mb-1 font-medium">{c.summary}</div>}
+      <ul className="mb-2 space-y-0.5 text-xs text-slate-600 dark:text-slate-300">
+        {c.items.map((it, i) => (
+          <li key={i}>• {it}</li>
+        ))}
+      </ul>
+      {c.status === "pending" ? (
+        <div className="flex gap-2">
+          <button
+            onClick={() => answer(true)}
+            disabled={busy !== null}
+            className="inline-flex flex-1 items-center justify-center gap-1 rounded-xl bg-emerald-600 px-3 py-1.5 text-sm font-medium text-white transition hover:bg-emerald-700 disabled:opacity-60"
+          >
+            {busy === "y" ? <Loader2 className="size-4 animate-spin" /> : <Check className="size-4" />} تأیید
+          </button>
+          <button
+            onClick={() => answer(false)}
+            disabled={busy !== null}
+            className="inline-flex flex-1 items-center justify-center gap-1 rounded-xl border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-700 transition hover:bg-slate-50 disabled:opacity-60 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-200"
+          >
+            {busy === "n" ? <Loader2 className="size-4 animate-spin" /> : <X className="size-4" />} نه
+          </button>
+        </div>
+      ) : (
+        <div className="text-xs font-medium text-slate-500">{done[c.status] ?? c.status}</div>
+      )}
+    </div>
+  );
+}
+
 function Bubble({ m, showQuick, onQuick }: { m: ChatMessage; showQuick: boolean; onQuick: (t: string) => void }) {
   const mine = m.role === "user";
   const proactive = m.role === "assistant" && m.kind !== "chat";
@@ -142,6 +191,7 @@ function Bubble({ m, showQuick, onQuick }: { m: ChatMessage; showQuick: boolean;
           {m.meta?.voice && <div className={cx("mb-1 flex items-center gap-1 text-xs", mine ? "text-white/80" : "text-slate-500")}><Mic className="size-3" /> ویس</div>}
           {mine ? <div className="whitespace-pre-wrap leading-7" dir="auto">{m.content}</div> : <Markdown>{m.content}</Markdown>}
         </div>
+        {m.meta?.confirm && <ConfirmCard m={m} />}
         {m.meta?.actions && m.meta.actions.length > 0 && (
           <div className="flex flex-wrap gap-1">
             {m.meta.actions.map((a, i) => (

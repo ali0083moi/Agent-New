@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from .. import jobs, journal, memory, notify, prefs, sessions, timeutil
+from .. import jobs, journal, memory, notify, pending, prefs, sessions, timeutil
 from ..bus import bus
 from ..config import get_settings
 from ..db import Message, session
@@ -144,7 +144,7 @@ class Attachment:
 def _summary(name: str, args: dict[str, Any], result: dict[str, Any]) -> str:
     label = TOOL_LABELS.get(name, name)
     if result.get("needs_confirmation"):
-        return f"{label}: منتظر تأیید"
+        return f"{label}: منتظر تأیید شما"
     if "error" in result:
         return f"{label}: ⚠️"
     try:
@@ -246,13 +246,19 @@ def _turn_groups(session_id: int, text: str, attachments: list[str] = ()) -> lis
 def _action_log(name: str, args: dict[str, Any], result: dict[str, Any]) -> str:
     """Compact machine-readable trace kept in history so the model remembers ids."""
     if result.get("needs_confirmation"):
-        return f"{name} waiting for user confirmation ({result.get('what', '')})"
+        return f"{name} NOT done yet — ✅/❌ buttons shown to the user ({result.get('what', '')})"
+    if name == "ask_approval" and result.get("buttons_shown"):
+        return f"ask_approval — ✅/❌ buttons shown to the user for: {args.get('summary', '')}"
+    if "existing_task" in result or "existing_event" in result:
+        ex = result.get("existing_task") or result.get("existing_event")
+        return f"{name} NOT done — same as existing {'task' if 'existing_task' in result else 'event'}#{ex['id']} «{ex['title']}»"
     if "error" in result:
-        return f"{name} failed: {result['error']}"
+        return f"{name} failed: {str(result['error'])[:200]}"
     ids = []
     for key in ("task", "event", "followup", "memory", "goal", "recurring_event", "habit", "commitment", "project"):
         if isinstance(result.get(key), dict) and "id" in result[key]:
-            ids.append(f"{key}#{result[key]['id']}")
+            title = result[key].get("title") or result[key].get("name") or ""
+            ids.append(f"{key}#{result[key]['id']}" + (f" «{title[:60]}»" if title else ""))
     if name == "add_recurring_events":
         ids += [f"class#{c['id']} {c['title']}" for c in result.get("created", [])]
     if name == "break_down_task":
@@ -365,7 +371,8 @@ async def run_agent(
                         "ok": "error" not in result and not result.get("needs_confirmation"),
                         "label": _summary(call.name, args, result),
                         "log": _action_log(call.name, args, result),
-                        "visible": call.name in TOOL_LABELS,
+                        "visible": call.name in TOOL_LABELS and not result.get("needs_confirmation")
+                        and not ("existing_task" in result or "existing_event" in result),
                     }
                 )
                 messages.append(
@@ -504,6 +511,17 @@ async def handle_user_message(
             user_msg = notify.store_message("user", content, channel, meta=meta, session_id=session_id)
             session_id = user_msg["session_id"]
 
+            # a bare «آره» / «نه» to a message with ✅/❌ buttons: do it right away, no LLM needed
+            answer = pending.quick_answer(content) if not attachments and not meta.get("forwarded_from") else None
+            if answer is not None:
+                with session() as s:
+                    waiting = pending.waiting_message_id(s, session_id)
+                if waiting is not None:
+                    res = await pending.resolve(waiting, answer, channel)
+                    assistant_msg = res.get("message") or notify.store_message(
+                        "assistant", res["text"], channel, session_id=session_id)
+                    return user_msg, assistant_msg
+
             llm_content = content or "(کاربر فقط یک فایل/تصویر فرستاد)"
             if meta.get("forwarded_from"):
                 llm_content = f"[پیام فورواردشده از «{meta['forwarded_from']}» — احتمالاً اطلاعیه/تکلیف]\n" + llm_content
@@ -533,7 +551,12 @@ async def handle_user_message(
                 "undoable": journal.has_changes(turn_id),
                 "groups": groups,
             }
+            confirm = pending.turn_meta(turn_id)
+            if confirm:
+                assistant_meta["confirm"] = confirm
             assistant_msg = notify.store_message("assistant", reply, channel, meta=assistant_meta, session_id=session_id)
+            if confirm:
+                pending.attach(turn_id, assistant_msg["id"])
             if changed:
                 bus.publish("data_changed", sorted(changed))
             jobs.after_turn(user_msg["id"])

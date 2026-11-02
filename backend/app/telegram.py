@@ -448,7 +448,7 @@ class TelegramBot:
         chat_id = cq.get("message", {}).get("chat", {}).get("id")
         if str(chat_id) != str(owner_chat_id()):
             return
-        m = re.fullmatch(r"(qr|sz|ud):(\d+)(?::(\d+))?", data)
+        m = re.fullmatch(r"(qr|sz|ud|pa):(\d+)(?::(\w+))?", data)
         if not m:
             return
         kind, mid, arg = m.group(1), int(m.group(2)), m.group(3)
@@ -469,7 +469,16 @@ class TelegramBot:
             except Exception:  # noqa: BLE001
                 pass
 
-        if kind == "qr":
+        if kind == "pa":
+            from . import pending
+            from .agent.core import lock
+
+            await ack("⏳")
+            async with lock:
+                res = await pending.resolve(mid, arg == "y", "telegram")
+            await drop_keyboard()
+            await self.send(chat_id, res["text"])
+        elif kind == "qr":
             options = meta.get("quick_replies") or []
             idx = int(arg or 0)
             await ack()
@@ -521,6 +530,20 @@ class TelegramBot:
 
 # ---------------------------------------------------------------- module api
 bot: TelegramBot | None = None
+
+
+async def drop_buttons(message_id: int) -> None:
+    """Remove the inline keyboard of a message that was answered elsewhere (e.g. on the web)."""
+    with session() as s:
+        m = s.get(Message, message_id)
+        tg_id = (m.meta or {}).get("telegram_message_id") if m is not None else None
+    chat_id = owner_chat_id()
+    if bot is None or not tg_id or chat_id is None:
+        return
+    try:
+        await bot.call("editMessageReplyMarkup", chat_id=chat_id, message_id=int(tg_id), reply_markup={"inline_keyboard": []})
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def configured() -> bool:

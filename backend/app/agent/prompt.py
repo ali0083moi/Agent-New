@@ -32,6 +32,10 @@ The user may write in Finglish or English; always answer in Persian unless asked
   appointment or a plan, save it right away (add_task / add_event / classes via load_tools). Never just say "ok"
   without saving. If the deadline or the duration is unclear, make a sensible estimate, save, and say what you
   assumed (one short line) — ask a question only when it really matters.
+- Corrections are edits: when the user changes or corrects something they mentioned before («نه ساعتش ۶ بود»،
+  «ددلاینش رو بکن پنجشنبه»، «تغییرش بده»، «اون یکی رو …»، «عنوانش رو عوض کن») → update_task / update_event on the
+  EXISTING item (id from "Recently added/changed" or the [actions done] notes, or pass its title as task=/event=).
+  Never add a second copy. If add_task/add_event says a similar item exists, update that one instead.
 - Estimate durations realistically from what you know about the user (see "Learned about the user"); include
   travel and getting-ready time for things that happen somewhere else (see "Places & travel").
 - Homework after classes: create a task per assignment with due_next_session_of=<class id> (deadline = start of
@@ -46,8 +50,11 @@ The user may write in Finglish or English; always answer in Persian unless asked
   deadline or meeting and save it, linked to the matching class/project when obvious. Then confirm briefly.
 - Cost: you run on a cheap model. Before writing something where quality really matters (an email to a professor,
   SOP/CV/cover letter, a recommendation request) or building a complex plan, call use_strong_model once.
-- Deletions ask for confirmation: delete tools first return needs_confirmation — ask, and delete only after the
-  user confirms. "برگردون"/undo → undo_last.
+- Act, don't ask: adding, editing, completing, moving one thing → just do it and say what you did (the user can
+  press «برگردون»). NEVER end with a yes/no question like «ثبتش کنم؟» / «می‌خوای تغییرش بدم؟» — either do it, or
+  if it is a deletion, a bulk/big change or two readings are really plausible, call `ask_approval` with the concrete
+  tool calls: the user gets ✅/❌ buttons and ✅ runs them immediately. Delete tools show these buttons by
+  themselves. A pending proposal (listed in the context) is never redone by you. "برگردون"/undo → undo_last.
 - Be honest about productivity: praise real progress, call out procrastination kindly but clearly.
 - Confirm briefly what you saved (e.g. "✅ ثبت شد: ... — ددلاین سه‌شنبه ۱۸:۰۰"). Don't show IDs or raw JSON. Light
   Markdown (bold, bullets); no tables or headings in normal chat.
@@ -99,6 +106,34 @@ def _task_line(s: Session, t: Task) -> str:
     )
 
 
+def _recent_lines(s: Session, now) -> list[str]:
+    """Items created/changed in the last two days — what «اون», «همون»، «تغییرش بده» usually refer to."""
+    from ..db import Event, Journal
+
+    models = {"tasks": ("task", Task), "events": ("event", Event), "recurring_events": ("class", RecurringEvent)}
+    rows = (s.query(Journal).filter(Journal.created_at >= now - timedelta(hours=48), Journal.undone.is_(False),
+                                    Journal.table.in_(list(models)), Journal.op.in_(["create", "update"]))
+            .order_by(Journal.id.desc()).limit(60).all())
+    out, seen = [], set()
+    for j in rows:
+        if (j.table, j.row_id) in seen:
+            continue
+        seen.add((j.table, j.row_id))
+        tag, model = models[j.table]
+        obj = s.get(model, j.row_id)
+        if obj is None:
+            continue
+        when = ""
+        if tag == "task":
+            when = f" | {obj.status}" + (f" | due {timeutil.iso(obj.due_at)}" if obj.due_at else "")
+        elif tag == "event":
+            when = f" | {timeutil.iso(obj.start_at)}"
+        out.append(f"- [{tag} {obj.id}] {obj.title}{when} ({'added' if j.op == 'create' else 'changed'} {timeutil.iso(j.created_at)[5:]})")
+        if len(out) >= 8:
+            break
+    return ["\n## Recently added/changed (newest first — «اون/همون/تغییرش بده» usually means one of these)"] + out if out else []
+
+
 def build_context(s: Session, groups: list[str] | set[str] = (), mode: str = "chat") -> str:
     """Live snapshot of the user's world. mode="compose" is a slimmer version for proactive messages."""
     groups = set(groups)
@@ -131,6 +166,9 @@ def build_context(s: Session, groups: list[str] | set[str] = (), mode: str = "ch
     from .. import places
 
     lines += places.context_lines(s)
+    from .. import pending
+
+    lines += pending.context_lines(s)
 
     mems = sorted(s.query(Memory).all(), key=lambda m: (MEMORY_ORDER.get(m.category, 9), -m.id))
     cap = 15 if slim else 40
@@ -201,6 +239,8 @@ def build_context(s: Session, groups: list[str] | set[str] = (), mode: str = "ch
     lines += [_task_line(s, t) for t in tasks] or ["- (none)"]
     if total > limit:
         lines.append(f"- (+{total - limit} more without near deadlines — list_tasks to see them)")
+
+    lines += _recent_lines(s, now)
 
     lines.append("\n## Today & tomorrow")
     for day in cal.agenda(s, today, 2):

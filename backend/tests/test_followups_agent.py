@@ -78,7 +78,7 @@ def test_history_keeps_action_ids(clock, fake_llm):
     run(core.handle_user_message("اونو پاک کن", "web"))
     hist = fake_llm.calls[-1]["messages"]
     assistant_turns = [m for m in hist if m["role"] == "assistant"]
-    assert "add_task(task#1)" in assistant_turns[-1]["content"]
+    assert "add_task(task#1 «خرید کتاب»)" in assistant_turns[-1]["content"]
 
 
 def test_llm_failure_gives_friendly_reply(fake_llm):

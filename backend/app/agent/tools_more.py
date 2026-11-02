@@ -272,7 +272,7 @@ def update_habit(s: Session, ctx: Ctx, habit_id: int, **data):
       {"habit_id": {"type": "integer"}, "confirmed": _CONFIRM}, ["habit_id"], changes=("habits",))
 def delete_habit(s: Session, ctx: Ctx, habit_id: int, confirmed: bool = False):
     h = _get(s, Habit, habit_id, "عادت")
-    guard = journal.confirm_guard(ctx, f"habit:{h.id}", f"عادت «{h.title}» و همه سابقه‌اش", confirmed)
+    guard = journal.confirm_guard(ctx, f"habit:{h.id}", f"حذف عادت «{h.title}» و همه سابقه‌اش", confirmed)
     if guard:
         return guard
     for lg in s.query(HabitLog).filter(HabitLog.habit_id == h.id).all():
@@ -621,6 +621,80 @@ def load_tools(s: Session, ctx: Ctx, groups: list[str]):
     if guide:
         out["instructions"] = guide
     return out
+
+
+# ------------------------------------------------------------------ approval buttons
+NO_PROPOSE = {"ask_approval", "load_tools", "use_strong_model", "undo_last"}
+_TITLED = {"task_id": "Task", "event_id": "Event", "recurring_event_id": "RecurringEvent", "habit_id": "Habit",
+           "block_id": "PlannedBlock", "goal_id": "Goal"}
+
+
+def _describe(s: Session, name: str, args: dict[str, Any]) -> str:
+    from .. import db
+    from .core import TOOL_LABELS
+
+    label = TOOL_LABELS.get(name, name)
+    bits = []
+    for key, model in _TITLED.items():
+        if key in args:
+            obj = s.get(getattr(db, model), int(args[key]))
+            title = getattr(obj, "title", None) if obj is not None else None
+            if title is None and obj is not None and model == "PlannedBlock":
+                t = s.get(Task, obj.task_id)
+                title = t.title if t else None
+            if title:
+                bits.append(f"«{title}»")
+            break
+    for key in ("title", "task", "event", "name", "university", "project", "contact", "description"):
+        if args.get(key) and not bits:
+            bits.append(f"«{args[key]}»")
+    for key in ("due", "start", "status", "at"):
+        if args.get(key):
+            bits.append(f"{key}={args[key]}")
+    return (label + (" " + " ".join(bits) if bits else "")).strip()
+
+
+@tool(
+    "ask_approval",
+    "Show the user ✅/❌ buttons for concrete changes; pressing ✅ runs them immediately (you won't be asked again). "
+    "Use it ONLY for: deleting/cancelling things, bulk or big changes (moving/cancelling several items, a new "
+    "weekly plan), or when two readings of the request are really plausible. Never for a normal add/edit — just do "
+    "those (the user can undo). Each action is one tool call {tool, args} with real ids; actions must not depend on "
+    "each other's results.",
+    {"summary": {"type": "string", "description": "one short Persian line shown above the buttons"},
+     "actions": {"type": "array", "items": {"type": "object", "properties": {
+         "tool": {"type": "string"}, "args": {"type": "object"}}, "required": ["tool", "args"]}}},
+    ["summary", "actions"],
+)
+def ask_approval(s: Session, ctx: Ctx, summary: str, actions: list[dict[str, Any]]):
+    from .. import pending
+    from .core import READ_ONLY
+    from .tools import REF_MODELS, REGISTRY, coerce_args
+
+    if not isinstance(actions, list) or not actions:
+        return {"error": "actions must be a non-empty list of {tool, args}"}
+    ready = []
+    for i, a in enumerate(actions[:15]):
+        name = (a or {}).get("tool") if isinstance(a, dict) else None
+        spec = REGISTRY.get(name or "")
+        if spec is None or name in NO_PROPOSE or name in READ_ONLY:
+            return {"error": f"actions[{i}]: '{name}' is not a change tool you can propose"}
+        args = a.get("args") or {}
+        if not isinstance(args, dict):
+            return {"error": f"actions[{i}].args must be an object"}
+        args, _ = coerce_args(spec, {k: v for k, v in args.items() if k != "confirmed"})
+        missing = [k for k in spec.parameters.get("required", []) if k not in args]
+        if missing:
+            return {"error": f"actions[{i}] ({name}): missing {', '.join(missing)}"}
+        for k, model in REF_MODELS.items():
+            if k in args and s.get(model, args[k]) is None:
+                return {"error": f"actions[{i}] ({name}): {k}={args[k]} does not exist — use ids from the context"}
+        ready.append((name, args))
+    for name, args in ready:
+        pending.create(s, ctx.turn_id, name, args, _describe(s, name, args), summary=summary.strip())
+    return {"buttons_shown": True, "count": len(ready),
+            "instruction": "The ✅/❌ buttons are shown under your reply. Reply with the proposal in 1-3 short lines; "
+                           "don't ask the user to type yes, and don't do these changes yourself now."}
 
 
 # ------------------------------------------------------------------ places & travel

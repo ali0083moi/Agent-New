@@ -17,6 +17,7 @@ export type ChatMessage = {
     part?: string;
     turn_id?: string;
     undoable?: boolean;
+    confirm?: { status: "pending" | "approved" | "rejected" | "expired" | "failed"; summary?: string; items: string[] };
     undone?: boolean;
     followup_id?: number;
     snoozed_until?: string;

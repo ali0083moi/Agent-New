@@ -118,22 +118,14 @@ def undo(turn_id: str) -> list[str]:
 
 # ---------------------------------------------------------------- confirmation guard
 def confirm_guard(ctx: Any, key: str, what: str, confirmed: bool) -> dict[str, Any] | None:
-    """None = go ahead. Otherwise a tool result asking the model to get the user's confirmation."""
-    if getattr(ctx, "trusted", False):  # explicit click in the web UI (it shows its own dialog)
+    """None = go ahead. Otherwise the call becomes a pending action with ✅/❌ buttons (see pending.py)."""
+    if getattr(ctx, "trusted", False):  # a button press / explicit click in the web UI
         return None
-    pending: dict[str, str] = dict(prefs.get("pending_confirmations") or {})
-    turn = _turn(ctx) or ""
-    if confirmed and key in pending and pending[key] != turn:
-        pending.pop(key)
-        prefs.set("pending_confirmations", pending)
-        return None
-    pending[key] = turn
-    if len(pending) > 50:
-        pending = dict(list(pending.items())[-50:])
-    prefs.set("pending_confirmations", pending)
-    return {
-        "needs_confirmation": True,
-        "what": what,
-        "instruction": "Do NOT delete yet. Ask the user to confirm (one short question). Only after they confirm in "
-        "their next message, call this tool again with confirmed=true.",
-    }
+    if confirmed:
+        from . import pending
+        from .db import session
+
+        with session() as s:
+            if pending.consume(s, key, _turn(ctx)):
+                return None
+    return {"needs_confirmation": True, "what": what, "key": key}

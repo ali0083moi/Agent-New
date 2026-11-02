@@ -470,6 +470,24 @@ class Journal(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
 
+class PendingAction(Base):
+    """A change waiting for the user's ✅/❌ button (deletions, bundles the assistant proposed). See pending.py."""
+
+    __tablename__ = "pending_actions"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    turn_id: Mapped[str] = mapped_column(String(40), index=True)
+    message_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    tool: Mapped[str] = mapped_column(String(64))
+    args: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    key: Mapped[str] = mapped_column(String(80), default="")  # e.g. task:12 — matches a later confirmed=true call
+    what: Mapped[str] = mapped_column(Text, default="")
+    summary: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(16), default="pending")  # pending|approved|rejected|expired|failed
+    result: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
 class KV(Base):
     """User preferences and small bits of app state."""
 

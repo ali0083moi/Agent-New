@@ -15,7 +15,7 @@ from dataclasses import dataclass
 CORE = [
     "get_agenda", "list_tasks", "add_task", "update_task", "complete_task", "delete_task",
     "add_event", "check_availability", "log_work", "start_focus", "stop_focus",
-    "remember", "schedule_followup", "undo_last", "load_tools", "use_strong_model",
+    "remember", "schedule_followup", "undo_last", "load_tools", "use_strong_model", "ask_approval",
 ]
 
 

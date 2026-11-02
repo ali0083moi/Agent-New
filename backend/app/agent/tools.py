@@ -13,7 +13,7 @@ from typing import Any, Callable
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from .. import cal, followups, insights, journal, planner, prefs, projects, serialize, stats, timeutil
+from .. import cal, followups, insights, journal, match, planner, prefs, projects, serialize, stats, timeutil
 from ..db import (Commitment, Contact, Event, Followup, Goal, Habit, Memory, PlannedBlock, Project, RecurringEvent,
                   Task, VocabWord, WorkLog, session)
 
@@ -214,7 +214,7 @@ async def execute(name: str, raw_args: str | dict[str, Any], ctx: Ctx) -> dict[s
             notes.append(f"saved without {', '.join(dropped)} (the linked item does not exist)")
             result = await _call(spec, args, ctx, notes)
         if isinstance(result, dict) and result.get("needs_confirmation"):
-            return result
+            return _propose(ctx, name, args, result)
         ctx.changed.update(spec.changes)
         if "tasks" in spec.changes and name not in NO_REPLAN:
             ctx.replan = True
@@ -232,6 +232,21 @@ async def execute(name: str, raw_args: str | dict[str, Any], ctx: Ctx) -> dict[s
     except Exception as e:  # noqa: BLE001
         log.exception("tool %s failed", name)
         return {"error": str(e), "notes": notes}
+
+
+APPROVAL_NOTE = ("✅/❌ buttons are now shown under your reply; pressing ✅ runs this immediately. Do NOT ask the user "
+                 "to type a confirmation and do NOT call this tool again. Say in one short line what will happen.")
+
+
+def _propose(ctx: Ctx, name: str, args: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
+    """A call that needs the user's approval becomes a pending action (buttons on web and Telegram)."""
+    from .. import pending
+
+    args = {k: v for k, v in args.items() if k != "confirmed"}
+    with session() as s:
+        pending.create(s, ctx.turn_id, name, args, result.get("what") or name, key=result.get("key", ""))
+    ctx.changed.add("pending")
+    return {"needs_confirmation": True, "what": result.get("what"), "buttons_shown": True, "instruction": APPROVAL_NOTE}
 
 
 async def _call(spec: "ToolSpec", args: dict[str, Any], ctx: Ctx, notes: list[str]) -> Any:
@@ -262,6 +277,47 @@ def _get(s: Session, model, obj_id: int, label: str):
     if obj is None:
         raise ValueError(f"{label} با شناسه {obj_id} پیدا نشد — only use ids shown in the context or returned by tools")
     return obj
+
+
+_TASK_REF = {"type": "string", "description": "The task's title (or a clear part of it) — use when you don't have its id."}
+_EVENT_REF = {"type": "string", "description": "The event's title — use when you don't have its id."}
+
+
+def _task_ref(s: Session, task_id: Any, task: str | None) -> Task:
+    """The task the model means: by id, else by title (so a correction edits the existing task)."""
+    if task_id not in (None, "", 0):
+        t = s.get(Task, int(task_id))
+        if t is not None:
+            return t
+        if not task:
+            raise ValueError(f"task_id {task_id} does not exist — use ids from the context, or pass task=<its title>")
+    if task:
+        t, close = match.find_task(s, task)
+        if t is None:
+            raise ValueError(f"no task matches «{task}» — call list_tasks to find it")
+        if close:
+            opts = "; ".join(f"[task {x.id}] {x.title}" for x in [t, *close])
+            raise ValueError(f"several tasks match «{task}»: {opts} — pass task_id")
+        return t
+    raise ValueError("which task? pass task_id (from the context) or task=<its title>")
+
+
+def _event_ref(s: Session, event_id: Any, event: str | None) -> Event:
+    if event_id not in (None, "", 0):
+        ev = s.get(Event, int(event_id))
+        if ev is not None:
+            return ev
+        if not event:
+            raise ValueError(f"event_id {event_id} does not exist — use ids from the context, or pass event=<its title>")
+    if event:
+        ev, close = match.find_event(s, event)
+        if ev is None:
+            raise ValueError(f"no upcoming event matches «{event}» — call get_agenda to find it")
+        if close:
+            opts = "; ".join(f"[event {x.id}] {x.title} {timeutil.iso(x.start_at)}" for x in [ev, *close])
+            raise ValueError(f"several events match «{event}»: {opts} — pass event_id")
+        return ev
+    raise ValueError("which event? pass event_id (from the context) or event=<its title>")
 
 
 def _project(s: Session, ref: Any, warnings: list[str]) -> Project | None:
@@ -360,6 +416,8 @@ def list_tasks(s: Session, ctx: Ctx, status: str = "open", category: str | None 
                    "description": "high = deep/hard work (essays, projects, studying), low = easy admin/errands"},
         "parent_id": {"type": "integer", "description": "Parent task (makes this a subtask / milestone)."},
         "project": {"type": "string", "description": "Project name or nickname (e.g. 'پروژه ماشین'). Resolved by name."},
+        "allow_duplicate": {"type": "boolean", "description": "Only after add_task said a similar task exists AND it is "
+                            "really a separate task."},
     },
     ["title"],
     changes=("tasks", "followups"),
@@ -379,6 +437,7 @@ def add_task(
     energy: str = "normal",
     parent_id: int | None = None,
     project: str | None = None,
+    allow_duplicate: bool = False,
 ):
     due_at = timeutil.parse_datetime(due) if due else None
     warnings: list[str] = []
@@ -405,6 +464,16 @@ def add_task(
         category = cal.KIND_CATEGORY.get(rec.kind, "personal")
     if rec is not None and not goal_id:
         goal_id = rec.goal_id
+    if not allow_duplicate and not ctx.trusted:
+        dup = match.similar_open_task(s, title, due_at, parent.id if parent else None)
+        if dup is not None:
+            return {
+                "error": f"NOT added: an open task that looks the same already exists: [task {dup.id}] «{dup.title}»"
+                + (f" due {timeutil.iso(dup.due_at)}" if dup.due_at else "")
+                + f". If the user is changing/correcting it, call update_task(task_id={dup.id}, ...) instead. Only if it "
+                "is really a different task, call add_task again with allow_duplicate=true.",
+                "existing_task": serialize.task(s, dup),
+            }
     learned = insights.suggest_minutes(s, title, _cat(category))
     history_note = None
     if learned is not None:
@@ -444,9 +513,11 @@ def add_task(
 
 @tool(
     "update_task",
-    "Update a task (any field). status: todo|doing|done|cancelled. add_note appends a progress note.",
+    "Update / correct / reschedule an existing task (any field) — use this, not add_task, when the user changes "
+    "something about a task they mentioned before. status: todo|doing|done|cancelled. add_note appends a note.",
     {
         "task_id": {"type": "integer"},
+        "task": _TASK_REF,
         "title": {"type": "string"},
         "description": {"type": "string"},
         "category": {"type": "string", "enum": CATEGORIES},
@@ -459,11 +530,11 @@ def add_task(
         "energy": {"type": "string", "enum": ["high", "normal", "low"]},
         "project": {"type": "string", "description": "Project name/nickname, or 'none' to unlink."},
     },
-    ["task_id"],
+    [],
     changes=("tasks", "followups", "schedule"),
 )
-def update_task(s: Session, ctx: Ctx, task_id: int, **fields):
-    t = _get(s, Task, task_id, "تسک")
+def update_task(s: Session, ctx: Ctx, task_id: int | None = None, task: str | None = None, **fields):
+    t = _task_ref(s, task_id, task)
     journal.before_update(s, ctx, t, f"ویرایش «{t.title}»")
     warnings: list[str] = []
     if "project" in fields:
@@ -537,14 +608,16 @@ def _sync_parent(s: Session, parent_id: int, ctx: Ctx | None) -> None:
     "Mark a task done. Optionally log how many minutes it took.",
     {
         "task_id": {"type": "integer"},
+        "task": _TASK_REF,
         "spent_minutes": {"type": "integer", "description": "Time spent now (not already logged)."},
         "note": {"type": "string"},
     },
-    ["task_id"],
+    [],
     changes=("tasks", "followups", "stats", "schedule"),
 )
-def complete_task(s: Session, ctx: Ctx, task_id: int, spent_minutes: int | None = None, note: str | None = None):
-    t = _get(s, Task, task_id, "تسک")
+def complete_task(s: Session, ctx: Ctx, task_id: int | None = None, task: str | None = None,
+                  spent_minutes: int | None = None, note: str | None = None):
+    t = _task_ref(s, task_id, task)
     journal.before_update(s, ctx, t, f"انجام «{t.title}»")
     if spent_minutes:
         end = timeutil.now()
@@ -566,14 +639,16 @@ def complete_task(s: Session, ctx: Ctx, task_id: int, spent_minutes: int | None 
     return {"task": serialize.task(s, t)}
 
 
-_CONFIRM = {"type": "boolean", "description": "true only after the user confirmed in a previous message"}
+_CONFIRM = {"type": "boolean", "description": "Leave out. (Deletions show ✅/❌ buttons to the user automatically.)"}
 
 
-@tool("delete_task", "Delete a task permanently (asks for confirmation first). Prefer status=cancelled.",
-      {"task_id": {"type": "integer"}, "confirmed": _CONFIRM}, ["task_id"], changes=("tasks", "followups", "schedule"))
-def delete_task(s: Session, ctx: Ctx, task_id: int, confirmed: bool = False):
-    t = _get(s, Task, task_id, "تسک")
-    guard = journal.confirm_guard(ctx, f"task:{t.id}", f"تسک «{t.title}»", confirmed)
+@tool("delete_task", "Delete a task permanently (the user gets ✅/❌ buttons). Prefer status=cancelled.",
+      {"task_id": {"type": "integer"}, "task": _TASK_REF, "confirmed": _CONFIRM}, [],
+      changes=("tasks", "followups", "schedule"))
+def delete_task(s: Session, ctx: Ctx, task_id: int | None = None, task: str | None = None, confirmed: bool = False):
+    t = _get(s, Task, task_id, "تسک") if task_id and not task else _task_ref(s, task_id, task)
+    task_id = t.id
+    guard = journal.confirm_guard(ctx, f"task:{t.id}", f"حذف تسک «{t.title}»", confirmed)
     if guard:
         return guard
     for child in s.query(Task).filter(Task.parent_id == t.id).all():
@@ -674,7 +749,7 @@ def update_recurring_event(s: Session, ctx: Ctx, recurring_event_id: int, **data
       ["recurring_event_id"], changes=("schedule", "followups"))
 def delete_recurring_event(s: Session, ctx: Ctx, recurring_event_id: int, confirmed: bool = False):
     r = _get(s, RecurringEvent, recurring_event_id, "کلاس")
-    guard = journal.confirm_guard(ctx, f"recurring:{r.id}", f"کلاس «{r.title}»", confirmed)
+    guard = journal.confirm_guard(ctx, f"recurring:{r.id}", f"حذف کلاس «{r.title}»", confirmed)
     if guard:
         return guard
     journal.before_delete(s, ctx, r, f"حذف کلاس «{r.title}»")
@@ -699,14 +774,26 @@ def list_recurring_events(s: Session, ctx: Ctx):
         "kind": {"type": "string", "enum": EVENT_KINDS},
         "location": {"type": "string"},
         "notes": {"type": "string"},
+        "allow_duplicate": {"type": "boolean", "description": "Only after add_event said a similar event exists AND it "
+                            "is really a separate one."},
     },
     ["title", "start"],
     changes=("schedule",),
 )
 def add_event(s: Session, ctx: Ctx, title: str, start: str, end: str | None = None, duration_minutes: int | None = None,
-              kind: str = "appointment", location: str = "", notes: str = ""):
+              kind: str = "appointment", location: str = "", notes: str = "", allow_duplicate: bool = False):
     st = timeutil.parse_datetime(start)
     en = _parse_end(st, end, duration_minutes)
+    if not allow_duplicate and not ctx.trusted:
+        dup = match.similar_event(s, title, st)
+        if dup is not None:
+            return {
+                "error": f"NOT added: a similar event already exists: [event {dup.id}] «{dup.title}» "
+                f"{timeutil.iso(dup.start_at)}. If the user is changing/correcting it (e.g. a new time), call "
+                f"update_event(event_id={dup.id}, ...) instead. Only if it is really another event, call add_event again "
+                "with allow_duplicate=true.",
+                "existing_event": serialize.event(dup),
+            }
     ev = Event(title=title, start_at=st, end_at=en, kind=kind if kind in EVENT_KINDS else "other",
                location=location, notes=notes)
     s.add(ev)
@@ -722,20 +809,21 @@ def add_event(s: Session, ctx: Ctx, title: str, start: str, end: str | None = No
 
 @tool(
     "update_event",
-    "Update a one-off event.",
+    "Update / correct / move a one-off event (use this, not add_event, when the user changes an event).",
     {
         "event_id": {"type": "integer"},
+        "event": _EVENT_REF,
         "title": {"type": "string"},
         "start": {"type": "string", "description": DT_HELP},
         "end": {"type": "string", "description": DT_HELP},
         "location": {"type": "string"},
         "notes": {"type": "string"},
     },
-    ["event_id"],
+    [],
     changes=("schedule",),
 )
-def update_event(s: Session, ctx: Ctx, event_id: int, **data):
-    ev = _get(s, Event, event_id, "رویداد")
+def update_event(s: Session, ctx: Ctx, event_id: int | None = None, event: str | None = None, **data):
+    ev = _event_ref(s, event_id, event)
     if ev.source == "gcal":
         return {"error": "this event comes from the user's Google Calendar — it can only be changed there (it syncs back every 15 minutes)"}
     journal.before_update(s, ctx, ev, f"ویرایش «{ev.title}»")
@@ -753,13 +841,14 @@ def update_event(s: Session, ctx: Ctx, event_id: int, **data):
     return {"event": serialize.event(ev)}
 
 
-@tool("delete_event", "Delete a one-off event (asks for confirmation first).",
-      {"event_id": {"type": "integer"}, "confirmed": _CONFIRM}, ["event_id"], changes=("schedule",))
-def delete_event(s: Session, ctx: Ctx, event_id: int, confirmed: bool = False):
-    ev = _get(s, Event, event_id, "رویداد")
+@tool("delete_event", "Delete a one-off event (the user gets ✅/❌ buttons).",
+      {"event_id": {"type": "integer"}, "event": _EVENT_REF, "confirmed": _CONFIRM}, [], changes=("schedule",))
+def delete_event(s: Session, ctx: Ctx, event_id: int | None = None, event: str | None = None, confirmed: bool = False):
+    ev = _event_ref(s, event_id, event)
+    event_id = ev.id
     if ev.source == "gcal":
         return {"error": "this event comes from the user's Google Calendar — it can only be changed there (it syncs back every 15 minutes)"}
-    guard = journal.confirm_guard(ctx, f"event:{ev.id}", f"رویداد «{ev.title}»", confirmed)
+    guard = journal.confirm_guard(ctx, f"event:{ev.id}", f"حذف رویداد «{ev.title}»", confirmed)
     if guard:
         return guard
     journal.before_delete(s, ctx, ev, f"حذف «{ev.title}»")

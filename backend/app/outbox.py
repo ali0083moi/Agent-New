@@ -25,6 +25,8 @@ def buttons_for(message_id: int | None, meta: dict[str, Any] | None) -> list[lis
     if not message_id:
         return []
     rows: list[list[dict[str, str]]] = []
+    if (meta.get("confirm") or {}).get("status") == "pending":
+        rows.append([{"text": "✅ تأیید", "data": f"pa:{message_id}:y"}, {"text": "❌ نه", "data": f"pa:{message_id}:n"}])
     qr = meta.get("quick_replies") or []
     for k in range(0, len(qr), 3):
         rows.append([{"text": q, "data": f"qr:{message_id}:{j}"} for j, q in enumerate(qr[k:k + 3], start=k)])

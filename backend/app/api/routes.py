@@ -187,6 +187,26 @@ def undo_message(message_id: int):
     return {"text": actions.undo_message(message_id)}
 
 
+@router.post("/messages/{message_id}/approve")
+async def approve_message(message_id: int):
+    return await _answer_pending(message_id, True)
+
+
+@router.post("/messages/{message_id}/reject")
+async def reject_message(message_id: int):
+    return await _answer_pending(message_id, False)
+
+
+async def _answer_pending(message_id: int, approve: bool) -> dict[str, Any]:
+    from .. import pending, telegram
+    from ..agent.core import lock
+
+    async with lock:
+        res = await pending.resolve(message_id, approve, "web")
+    await telegram.drop_buttons(message_id)
+    return {"ok": res["ok"], "text": res["text"]}
+
+
 @router.post("/messages/{message_id}/snooze")
 def snooze_message(message_id: int, minutes: int = 60):
     return {"text": actions.snooze_message(message_id, minutes)}

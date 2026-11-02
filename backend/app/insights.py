@@ -257,3 +257,48 @@ def reminder_lines(stats: dict[str, Any]) -> list[str]:
         if v["sent"] >= 6 and v["rate"] < 0.15:
             lines.append(f"پیام‌های نوع {k} تقریباً همیشه نادیده گرفته می‌شوند؛ کمترشان کرده‌ام")
     return lines
+
+
+# ---------------------------------------------------------------- how the user studies / works
+def study_profile(s: Session, days: int = 60) -> dict[str, Any]:
+    """Typical session length (overall and per category), light weekdays, from real logged work."""
+    from statistics import median
+
+    since = timeutil.now() - timedelta(days=days)
+    logs = (s.query(WorkLog).filter(WorkLog.end_at.is_not(None), WorkLog.productive.is_(True),
+                                    WorkLog.start_at >= since, WorkLog.minutes >= 10).all())
+    if len(logs) < 6:
+        return {"learned": False, "sessions": len(logs)}
+    by_cat: dict[str, list[int]] = {}
+    per_day: dict[str, int] = {}
+    for lg in logs:
+        by_cat.setdefault(lg.category or "other", []).append(int(lg.minutes))
+        k = timeutil.weekday_key(lg.start_at.date())
+        per_day[k] = per_day.get(k, 0) + int(lg.minutes)
+    avg = sum(per_day.values()) / 7
+    light = [k for k in timeutil.WEEK_ORDER if per_day.get(k, 0) < 0.25 * avg]
+    return {
+        "learned": True,
+        "sessions": len(logs),
+        "session_minutes": int(median(int(lg.minutes) for lg in logs)),
+        "by_category": {c: int(median(v)) for c, v in by_cat.items() if len(v) >= 4},
+        "light_days": light,
+    }
+
+
+def session_minutes(profile: dict[str, Any], category: str, default: int) -> int:
+    """Block length for a category: how long the user really works in one go (bounded)."""
+    if not profile.get("learned"):
+        return default
+    m = profile["by_category"].get(category) or profile["session_minutes"]
+    return max(25, min(120, int(round(m / 5) * 5)))
+
+
+def study_lines(profile: dict[str, Any]) -> list[str]:
+    if not profile.get("learned"):
+        return []
+    out = [f"usually works in ~{profile['session_minutes']}-minute sessions"
+           + (" (" + ", ".join(f"{c} ~{m}m" for c, m in profile["by_category"].items()) + ")" if profile["by_category"] else "")]
+    if profile["light_days"]:
+        out.append("rarely works on: " + ", ".join(profile["light_days"]))
+    return out

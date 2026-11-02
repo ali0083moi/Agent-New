@@ -28,6 +28,7 @@ DEFAULTS: dict[str, Any] = {
     "auto_plan_daily": True,
     # planning
     "focus_block_minutes": 90,
+    "study_hours": "",  # when the user likes deep work / studying, e.g. "20:00-23:30" or "06:30-08:00,20:00-23:00"
     "min_block_minutes": 30,
     "break_minutes": 15,
     "max_focus_minutes_per_day": 360,

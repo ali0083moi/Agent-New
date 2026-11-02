@@ -34,6 +34,7 @@ class Ctx:
     replan: bool = False
     groups: set[str] = field(default_factory=set)  # tool groups loaded for this turn (see toolsets)
     strong: bool = False  # this turn runs on the stronger model (use_strong_model / routing in agent.core)
+    plan_days: int = 7  # how far ahead the end-of-turn re-plan looks (a far deadline needs a longer horizon)
 
 
 # tools after which the plan doesn't need to be refreshed
@@ -265,7 +266,7 @@ def finalize(ctx: Ctx) -> None:
     try:
         with session() as s:
             if prefs.get("auto_replan", True, s=s) and planner.open_tasks(s):
-                planner.plan(s, days=7)
+                planner.plan(s, days=max(7, ctx.plan_days))
                 ctx.changed.update({"schedule", "followups"})
     except Exception:  # noqa: BLE001
         log.exception("auto re-plan failed")
@@ -348,6 +349,38 @@ def _parse_end(start: datetime, end: str | None, duration: int | None, default: 
     if end:
         return timeutil.parse_datetime(end)
     return start + timedelta(minutes=int(duration or default))
+
+
+def deadline_plan(s: Session, ctx: Ctx, t: Task) -> dict[str, Any] | None:
+    """Plan backwards from a task's deadline right away, so the reply can say when the work happens (and where)."""
+    now = timeutil.now()
+    if t.due_at is None or t.status not in ("todo", "doing") or t.due_at <= now or t.parent_id is None and \
+            s.query(Task.id).filter(Task.parent_id == t.id, Task.status.in_(["todo", "doing"])).first():
+        return None
+    if not prefs.get("auto_replan", True, s=s):
+        return None
+    from .. import daymap
+
+    days = max(7, min(21, (t.due_at.date() - now.date()).days + 1))
+    ctx.plan_days = max(ctx.plan_days, days)
+    planner.plan(s, days=days)
+    need = planner.remaining_minutes(s, t)
+    blocks = (s.query(PlannedBlock).filter(PlannedBlock.task_id == t.id, PlannedBlock.status == "planned",
+                                           PlannedBlock.end_at > now, PlannedBlock.end_at <= t.due_at)
+              .order_by(PlannedBlock.start_at).all())
+    planned = sum(int((b.end_at - max(b.start_at, now)).total_seconds() // 60) for b in blocks)
+    cache: dict = {}
+    sessions = []
+    for b in blocks[:6]:
+        where = daymap.place_at(s, b.start_at, cache)
+        sessions.append(f"{timeutil.weekday_key(b.start_at.date())} {b.start_at.strftime('%m-%d %H:%M')}-"
+                        f"{b.end_at.strftime('%H:%M')}" + (f" @{where}" if where else ""))
+    out: dict[str, Any] = {"needs_minutes": need, "planned_minutes": planned, "fits": planned >= need,
+                           "sessions": sessions + (["…"] if len(blocks) > 6 else [])}
+    if planned < need:
+        out["warning"] = ("it does NOT fit before the deadline with the current workload — tell the user plainly and "
+                          "suggest what to move/drop or how much extra time per day it needs")
+    return out
 
 
 def _cancel_task_followups(s: Session, task_id: int) -> None:
@@ -504,6 +537,10 @@ def add_task(
         "task": serialize.task(s, t),
         "reminders_scheduled": [timeutil.iso(f.due_at) for f in planned if f.kind != "overdue"],
     }
+    if t.due_at is not None and not ctx.trusted:
+        plan = deadline_plan(s, ctx, t)
+        if plan:
+            out["plan"] = plan
     if history_note:
         out["duration_history"] = history_note
     if warnings:
@@ -562,6 +599,10 @@ def update_task(s: Session, ctx: Ctx, task_id: int | None = None, task: str | No
     if t.status in ("todo", "doing"):
         followups.ensure_task_followups(s, t, prefs.all_prefs(s), timeutil.now())
     out: dict[str, Any] = {"task": serialize.task(s, t)}
+    if ("due" in fields or "estimated_minutes" in fields) and not ctx.trusted:
+        plan = deadline_plan(s, ctx, t)
+        if plan:
+            out["plan"] = plan
     if warnings:
         out["warnings"] = warnings
     return out
@@ -1189,6 +1230,8 @@ async def weekly_report(ctx: Ctx, week_offset: int = 0, project: str | None = No
     "ielts_target_band, ielts_exam_date, vocab_review_time, vocab_daily_count, daily_budget_usd, "
     "adaptive_reminders, semantic_memory, auto_facts, professor_followup_days, "
     "prep_minutes (getting ready before leaving home), leave_reminders, session_idle_hours, "
+    "study_hours ('HH:MM-HH:MM[,HH:MM-HH:MM]' — when they like to study / do deep work; the planner puts hard tasks "
+    "there), focus_block_minutes (how long they usually work in one go), "
     "llm_chat_model / llm_fast_model / llm_vision_model / "
     "llm_ielts_model (override AI models; '' = default). "
     "Special key current_week_parity ('odd'|'even') tells which university week (فرد/زوج) the current week is.",
@@ -1211,6 +1254,8 @@ def update_preferences(s: Session, ctx: Ctx, changes: dict[str, Any]):
             raise ValueError(f"تنظیم ناشناخته: {key}")
         if key.endswith("_time") or key in ("work_start", "work_end"):
             value = timeutil.parse_time(value).strftime("%H:%M")
+        if key == "study_hours":
+            value = ",".join(f"{a.strftime('%H:%M')}-{b.strftime('%H:%M')}" for a, b in timeutil.parse_ranges(value))
         if key in ("weekly_report_day", "weekly_planning_day"):
             value = timeutil.normalize_weekday(value)
         if key in ("semester_start", "ielts_exam_date") and value:

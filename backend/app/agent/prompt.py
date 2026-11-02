@@ -36,6 +36,12 @@ The user may write in Finglish or English; always answer in Persian unless asked
   «ددلاینش رو بکن پنجشنبه»، «تغییرش بده»، «اون یکی رو …»، «عنوانش رو عوض کن») → update_task / update_event on the
   EXISTING item (id from "Recently added/changed" or the [actions done] notes, or pass its title as task=/event=).
   Never add a second copy. If add_task/add_event says a similar item exists, update that one instead.
+- Deadlines: add_task / update_task return `plan` — the work sessions the planner found before the deadline (with
+  where the user will be). Tell the user in one or two lines when they'll work on it, like a person would («امشب
+  ۲۰ تا ۲۱:۳۰ خونه، پنجشنبه بین دو کلاس توی دانشگاه»), and say clearly if it doesn't fit and what you suggest.
+- Think about the user's real day (see "The user's day"): they can't work while in class, at the company or on
+  the road; between two classes at the university they can do reading/light work; a metro ride suits vocab or
+  listening; after a long day at work, evenings are for lighter tasks unless a deadline is close.
 - Estimate durations realistically from what you know about the user (see "Learned about the user"); include
   travel and getting-ready time for things that happen somewhere else (see "Places & travel").
 - Homework after classes: create a task per assignment with due_next_session_of=<class id> (deadline = start of
@@ -241,6 +247,14 @@ def build_context(s: Session, groups: list[str] | set[str] = (), mode: str = "ch
         lines.append(f"- (+{total - limit} more without near deadlines — list_tasks to see them)")
 
     lines += _recent_lines(s, now)
+    from .. import daymap
+
+    try:
+        lines += daymap.context_lines(s, now)
+    except Exception:  # noqa: BLE001 — the day map is a nice-to-have; never break the prompt
+        import logging
+
+        logging.getLogger(__name__).exception("day map failed")
 
     lines.append("\n## Today & tomorrow")
     for day in cal.agenda(s, today, 2):
@@ -286,6 +300,11 @@ def build_context(s: Session, groups: list[str] | set[str] = (), mode: str = "ch
         lines.append(f"- peak productive hours: {insights.describe_hours(peaks['hours'])}" + ("" if peaks["learned"] else " (default, not enough data yet)"))
         lines += [f"- {x}" for x in insights.estimation_lines(factors) + insights.reminder_lines(insights.response_stats(s))]
         lines += [f"- {x}" for x in insights.duration_lines(s)]
+        lines += [f"- {x}" for x in insights.study_lines(insights.study_profile(s))]
+        if p.get("study_hours"):
+            lines.append(f"- likes to study / do deep work at {p['study_hours']} (the planner uses this)")
+        else:
+            lines.append("- when they like to study is unknown — when it comes up, ask and save it (update_preferences study_hours)")
     sp = prefs.get("speaking_practice", s=s)
     if "ielts" in groups or sp:
         ip = ielts_mod.progress(s)

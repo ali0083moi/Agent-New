@@ -161,7 +161,7 @@ def test_block_nudges_and_focus(clock, fake_llm):
         s.flush()
         followups.generate(s)
         kinds = sorted(f.kind for f in s.query(Followup).filter(Followup.block_id == b.id))
-        assert kinds == ["block_end", "block_start"]
+        assert kinds == ["block_start"]  # no "block ended" ping any more
         tid, bid = t.id, b.id
     clock.value = datetime(2026, 10, 19, 11, 0)
     fake_llm.script = [ChatResult(content="وقت مطالعه‌ست! شروع کنیم؟")]

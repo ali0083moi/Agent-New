@@ -254,10 +254,14 @@ def plan(s: Session, days: int = 7, start: datetime | None = None, commit: bool 
 
     invalidate(s)
     peaks = set(insights.peak_hours(s)["hours"])
+    stated = study_hours(p)
+    if stated:
+        peaks = stated  # the user told us when they like to study: that beats what we guessed
     ws_h, we_h = timeutil.parse_time(p["work_start"]).hour, timeutil.parse_time(p["work_end"]).hour
     window = set(range(ws_h, we_h)) if we_h > ws_h else set(range(ws_h, 24)) | set(range(0, we_h))
     if not peaks & window:
         peaks = set()  # peaks outside the productive window can't be used: plain EDF
+    profile = insights.study_profile(s)
     tasks = sorted(schedulable_tasks(s), key=_task_key)
     if commit:
         # blocks of tasks that became projects (have subtasks) or are no longer open
@@ -308,7 +312,7 @@ def plan(s: Session, days: int = 7, start: datetime | None = None, commit: bool 
                     cursor = round_up(cursor + timedelta(minutes=15))
                     continue
                 need = remaining[chosen.id]
-                length = min(focus, need, room, cap_left)
+                length = min(insights.session_minutes(profile, chosen.category, focus), need, room, cap_left)
                 due = effective_due(chosen)
                 if due and due > cursor:
                     length = min(length, _minutes(cursor, due))
@@ -364,6 +368,24 @@ def plan(s: Session, days: int = 7, start: datetime | None = None, commit: bool 
         for b in new_blocks
     ]
     return PlanResult(blocks=blocks_out, unscheduled=unscheduled, warnings=warnings)
+
+
+def study_hours(p: dict[str, Any]) -> set[int]:
+    """Hours the user said they like to study / do deep work (pref study_hours)."""
+    hours: set[int] = set()
+    try:
+        ranges = timeutil.parse_ranges(p.get("study_hours") or "")
+    except ValueError:
+        return hours
+    for a, b in ranges:
+        h = a.hour
+        end = b.hour + (1 if b.minute else 0)
+        for _ in range(24):
+            if h == end % 24:
+                break
+            hours.add(h)
+            h = (h + 1) % 24
+    return hours
 
 
 def _pick(candidates: list[Task], cursor: datetime, peaks: set[int]) -> Task | None:

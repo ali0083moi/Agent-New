@@ -147,26 +147,10 @@ def generate(s: Session, now: datetime | None = None) -> int:
     for t in s.query(Task).filter(Task.status.in_(["todo", "doing"]), Task.due_at.is_not(None)).all():
         n += len(ensure_task_followups(s, t, p, now, rstats))
 
-    # 3) planned work blocks: nudge at start, check at end (fewer nudges if they're always ignored)
-    ignore_starts = insights.quiet_kind(rstats, "block_start")
+    # 3) planned work: ONE nudge when a work session starts (consecutive blocks = one session), a few a day at
+    #    most, and only for sessions worth it. No "block ended" pings — the evening review asks how it went.
     if p.get("block_nudges", True):
-        blocks = (
-            s.query(PlannedBlock)
-            .filter(PlannedBlock.status == "planned", PlannedBlock.start_at >= now - timedelta(minutes=10),
-                    PlannedBlock.start_at <= horizon)
-            .all()
-        )
-        for b in blocks:
-            payload = {"start": timeutil.iso(b.start_at), "end": timeutil.iso(b.end_at)}
-            task = s.get(Task, b.task_id)
-            if ignore_starts and task is not None and task.priority != 1:
-                pass  # the user ignores start nudges: keep them only for important tasks
-            elif _ensure(s, f"block_start:{b.id}:{payload['start']}", "block_start", b.start_at, block_id=b.id,
-                         task_id=b.task_id, payload=payload):
-                n += 1
-            if _ensure(s, f"block_end:{b.id}:{payload['end']}", "block_end", b.end_at + timedelta(minutes=5),
-                       block_id=b.id, task_id=b.task_id, payload=payload):
-                n += 1
+        n += _session_nudges(s, now, horizon, p, rstats)
 
     # 4) daily brief & review, weekly report
     for day in (now.date(), now.date() + timedelta(days=1)):
@@ -266,6 +250,58 @@ def _leave_reminders(s: Session, now: datetime) -> int:
     return n
 
 
+SESSION_NUDGES_PER_DAY = {"low": 1, "normal": 2, "high": 4}
+
+
+def work_sessions(blocks: list[PlannedBlock], gap_minutes: int = 25) -> list[list[PlannedBlock]]:
+    """Consecutive planned blocks (short breaks in between) form one work session."""
+    out: list[list[PlannedBlock]] = []
+    for b in sorted(blocks, key=lambda x: x.start_at):
+        if out and b.start_at.date() == out[-1][-1].end_at.date() and \
+                (b.start_at - out[-1][-1].end_at) <= timedelta(minutes=gap_minutes):
+            out[-1].append(b)
+        else:
+            out.append([b])
+    return out
+
+
+def _session_nudges(s: Session, now: datetime, horizon: datetime, p: dict[str, Any], rstats: dict[str, Any]) -> int:
+    # housekeeping: nudges whose block was re-planned away
+    for f in s.query(Followup).filter(Followup.status == "pending", Followup.kind.in_(["block_start", "block_end"])).all():
+        b = s.get(PlannedBlock, f.block_id) if f.block_id else None
+        if f.kind == "block_end" or b is None or b.status != "planned" or timeutil.iso(b.start_at) != (f.payload or {}).get("start"):
+            f.status = "cancelled"
+    s.flush()
+    blocks = (s.query(PlannedBlock).filter(PlannedBlock.status == "planned", PlannedBlock.start_at >= now - timedelta(minutes=10),
+                                           PlannedBlock.start_at <= horizon).all())
+    ignored = insights.quiet_kind(rstats, "block_start")
+    limit = SESSION_NUDGES_PER_DAY[_intensity(p)] if not ignored else 1
+    n = 0
+    for sess in work_sessions(blocks):
+        first = sess[0]
+        day = first.start_at.date().isoformat()
+        minutes = sum(int((b.end_at - b.start_at).total_seconds() // 60) for b in sess)
+        tasks = [s.get(Task, b.task_id) for b in sess]
+        urgent = any(t is not None and (t.priority == 1 or (t.due_at and t.due_at - first.start_at <= timedelta(hours=30)))
+                     for t in tasks)
+        if minutes < 45 and not urgent:
+            continue
+        if ignored and not urgent:
+            continue
+        taken = (s.query(Followup).filter(Followup.kind == "block_start", Followup.status.in_(["pending", "sent"]),
+                                          Followup.due_at >= timeutil.at(first.start_at.date(), "00:00"),
+                                          Followup.due_at < timeutil.at(first.start_at.date(), "00:00") + timedelta(days=1))
+                 .count())
+        if taken >= limit:
+            continue
+        payload = {"start": timeutil.iso(first.start_at), "end": timeutil.iso(first.end_at),
+                   "session_end": timeutil.iso(sess[-1].end_at), "blocks": [b.id for b in sess]}
+        if _ensure(s, f"block_start:{first.id}:{payload['start']}", "block_start", first.start_at, block_id=first.id,
+                   task_id=first.task_id, payload=payload):
+            n += 1
+    return n
+
+
 def _sent_today(s: Session, kind: str, day) -> bool:
     return (
         s.query(Followup)
@@ -323,6 +359,10 @@ def _idle_checkin(s: Session, now: datetime, p: dict[str, Any], rstats: dict[str
         return 0  # in class / at an event
     if s.query(Followup).filter(Followup.kind == "idle_checkin", Followup.status == "pending").count():
         return 0
+    from . import daymap
+
+    if daymap.busy_now(s, now) is not None:
+        return 0  # on the road / getting ready / at something
     day = now.date().isoformat()
     sent_today = s.query(Followup).filter(Followup.dedupe_key.like(f"idle:{day}:%")).count()
     limit = IDLE_MAX_PER_DAY[_intensity(p)]
@@ -391,6 +431,11 @@ def _still_valid(s: Session, f: Followup, now: datetime) -> bool:
     return True
 
 
+# reminders that can wait until the user is out of class / the meeting / the car
+DEFER_WHILE_BUSY = {"deadline", "task_checkin", "overdue", "idle_checkin", "rescue", "habit_reminder", "vocab_review",
+                    "contact_followup", "application_deadline", "weekly_planning", "contact_reply"}
+
+
 def due_now(s: Session, now: datetime | None = None) -> list[Followup]:
     """Pending follow-ups that should go out now. Stale/invalid ones get cancelled,
     ones falling in quiet hours get postponed to wake-up time."""
@@ -402,6 +447,13 @@ def due_now(s: Session, now: datetime | None = None) -> list[Followup]:
         if not _still_valid(s, f, now):
             f.status = "cancelled"
             continue
+        if f.kind in DEFER_WHILE_BUSY:
+            from . import daymap
+
+            busy_until = daymap.busy_now(s, now)
+            if busy_until is not None and busy_until - now <= timedelta(hours=4):
+                f.due_at = busy_until + timedelta(minutes=5)
+                continue
         if f.kind not in ("custom", "leave") and is_quiet(now, p):
             if f.kind in ("block_start", "block_end", "idle_checkin", "focus_long", "daily_review"):
                 f.status = "cancelled"

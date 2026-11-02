@@ -25,6 +25,17 @@ def _task_line(s, t: Task) -> str:
     return " — ".join(parts)
 
 
+def _planned_today(s, now) -> list[str]:
+    rows = (s.query(PlannedBlock).filter(PlannedBlock.start_at >= timeutil.at(now.date(), "00:00"),
+                                         PlannedBlock.start_at < now).order_by(PlannedBlock.start_at).all())
+    out = []
+    for b in rows:
+        t = s.get(Task, b.task_id)
+        if t is not None:
+            out.append(f"{b.start_at.strftime('%H:%M')}-{b.end_at.strftime('%H:%M')} «{t.title}» ({b.status})")
+    return out
+
+
 def build(f: Followup) -> tuple[str, str, list[str]] | None:
     """Return (instruction for the LLM, fallback text, quick replies) for a follow-up."""
     with session() as s:
@@ -86,11 +97,29 @@ def build(f: Followup) -> tuple[str, str, list[str]] | None:
                 return None
             span = f"{timeutil.fa_time(b.start_at)} تا {timeutil.fa_time(b.end_at)}"
             if f.kind == "block_start":
+                from .. import daymap
+
+                ids = (f.payload or {}).get("blocks") or [b.id]
+                parts = []
+                for bid in ids:
+                    bb = s.get(PlannedBlock, bid)
+                    tt = s.get(Task, bb.task_id) if bb is not None else None
+                    if bb is not None and tt is not None:
+                        parts.append(f"{bb.start_at.strftime('%H:%M')}-{bb.end_at.strftime('%H:%M')} {_task_line(s, tt)}")
+                end = timeutil.parse_datetime((f.payload or {}).get("session_end") or timeutil.iso(b.end_at))
+                w = daymap.where_now(s, now)
+                worked = planner.logged_minutes(s, now.date())
                 instr = (
-                    f"A planned focus block (block id {b.id}) for task {t.id} {_task_line(s, t)} starts now ({span}). "
-                    "Nudge them to start; if they say they're starting, you will start the focus timer."
+                    "Time for a planned work session. Planned:\n" + "\n".join(parts) + "\n"
+                    f"Where the user is now: {w['now']}; next fixed thing: {w['next'] or 'nothing'}. "
+                    f"Logged work today so far: {worked} min.\n"
+                    "Write like a friend who knows their day — not like a timer: 2-4 short lines. Say what to work on "
+                    "now and WHY now (deadline, how much is left), a concrete first step, and until when they have "
+                    "(free until / next thing). If they've had a long day or it's late, suggest the lighter part. "
+                    "Never say 'block' or 'بلوک'. Ask if they're starting (if yes you'll start the focus timer)."
                 )
-                fallback = f"▶️ وقت کار روی «{t.title}» ({span})ه. شروع کنیم؟"
+                fallback = (f"وقتشه روی «{t.title}» کار کنی (تا {timeutil.fa_time(end)}). "
+                            "با یه قدم کوچیک شروع کن — شروع می‌کنی؟")
                 return instr, fallback, ["شروع کردم ▶️", "نیم ساعت دیگه", "امروز نمی‌رسم"]
             instr = (
                 f"The planned focus block (block id {b.id}) for task {t.id} «{t.title}» ({span}) just ended. "
@@ -116,9 +145,16 @@ def build(f: Followup) -> tuple[str, str, list[str]] | None:
             y = stats.productivity(s, now.date() - timedelta(days=1), now.date() - timedelta(days=1))
             hb = [h for h in habits.all_habits(s) if h["period"] == "daily"]
             g = gamify.summary(s)
+            from .. import daymap
+
             instr = (
-                "Morning brief. Write a friendly, energizing but compact plan for today: classes/events, the work blocks, "
-                "and the most important 1-3 things to finish. Mention deadlines in the next 3 days. Then ask what they "
+                "Morning brief. Write a friendly, energizing but compact plan for today the way a personal assistant "
+                "who knows their life would: when to get ready / leave and where they'll be, what each free window is "
+                "for (e.g. «بین دو کلاس فصل ۲ رو بخون», «امشب خونه: پروژه ماشین»), and the most important 1-3 things "
+                "to finish. Don't list work blocks mechanically and never say 'بلوک'. Mention deadlines in the next 3 "
+                "days.\n"
+                f"The day as they'll live it: {daymap.describe(s, now.date())}\n"
+                "Then ask what they "
                 "commit to today (one concrete promise, e.g. '۲ ساعت رایتینگ') so you can record it with add_commitment. "
                 "One short motivating line.\n"
                 f"Today's agenda: {day['items']}\nDue within 3 days: {[_task_line(s, x) for x in soon]}"
@@ -147,7 +183,8 @@ def build(f: Followup) -> tuple[str, str, list[str]] | None:
                 "did today that isn't logged yet (to log it) and mention tomorrow's key items briefly.\n"
                 f"Today stats: productive {st['total_productive_minutes']} min (goal {st['daily_goal_minutes']}), "
                 f"by category {st['by_category']}, completed {[x['title'] for x in st['completed_tasks']]}, "
-                f"blocks {st['blocks']}.\nCommitments: {commits}\n"
+                f"blocks {st['blocks']}.\nWork that was planned for today (ask how much of it got done and log it "
+                f"with log_work — don't call it 'blocks'): {_planned_today(s, now)}\nCommitments: {commits}\n"
                 f"Habits: {[(h['title'], h['today'], h['target'], h['streak']) for h in hb]}\nPoints today: {pts['total']}\n"
                 f"Tomorrow: {tomorrow['items']}"
             )

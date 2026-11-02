@@ -314,3 +314,13 @@ def in_window(t: time, start: time, end: time) -> bool:
     if start <= end:
         return start <= t < end
     return t >= start or t < end
+
+
+def parse_ranges(text: object) -> list[tuple[time, time]]:
+    """'20:00-23:30, 6-8' → [(20:00, 23:30), (06:00, 08:00)] (Persian digits and '–'/'تا' accepted)."""
+    out = []
+    for part in re.split(r"[,،;]| و ", to_latin_digits(str(text or ""))):
+        bits = re.split(r"\s*(?:-|–|تا|to)\s*", part.strip())
+        if len(bits) == 2 and all(bits):
+            out.append((parse_time(bits[0]), parse_time(bits[1])))
+    return out

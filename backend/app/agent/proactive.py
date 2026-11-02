@@ -72,9 +72,13 @@ def build(f: Followup) -> tuple[str, str, list[str]] | None:
             blocks_txt = ", ".join(f"{timeutil.fa_datetime(b.start_at)}" for b in blocks) or "none"
             if f.kind == "deadline":
                 hrs = payload.get("hours_before")
+                left = planner.remaining_minutes(s, t)
                 instr = (
                     f"Deadline reminder (~{hrs}h left) for task {t.id}: {_task_line(s, t)}. Status: {t.status}. "
-                    f"Upcoming planned blocks for it: {blocks_txt}. Remind them and ask where they are with it."
+                    f"Work still needed: about {left} min. When the plan has time for it: {blocks_txt}.\n"
+                    "Like a person who has their back: say how much is left and WHEN in their day it fits (use the "
+                    "day map: free windows, where they'll be), or say plainly that it's tight and what to drop. "
+                    "Ask where they are with it. Don't just repeat the deadline."
                 )
                 fallback = f"⏰ یادت نره: {_task_line(s, t)}. در چه حالیه؟"
             elif f.kind == "task_checkin":
@@ -200,8 +204,9 @@ def build(f: Followup) -> tuple[str, str, list[str]] | None:
             instr = (
                 f"Idle check-in: no contact for {p.get('idle_checkin_hours')}+ hours during their productive window. "
                 f"Planned around now: {now_items}. Top open tasks: {[_task_line(s, x) for x in top]}.\n"
-                "Ask casually what they're doing right now / if they're working on something, and whether there's "
-                "any new task you should know about. Keep it to 2 lines."
+                "Write ONE specific, human check-in (2 lines max) based on their day and what's most pressing — e.g. "
+                "«تونستی امروز به گزارش پروژه ماشین برسی؟ تا پنجشنبه حدود ۳ ساعت دیگه کار داره و امشب ۲۰ تا ۲۲ خونه "
+                "آزادی». Not a generic «چه خبر؟ مشغول چی هستی؟». You may also ask if something new came up."
             )
             fallback = "👋 چه خبر؟ الان مشغول چه کاری هستی؟ کار جدیدی هم هست که باید ثبت کنم؟"
             return instr, fallback, ["دارم کار می‌کنم", "استراحتم", "کار جدید دارم"]

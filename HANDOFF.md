@@ -2,45 +2,91 @@
 
 Last updated: 2026-11-02. Branch: `claude/charming-lovelace-b7blod`. Every push to this branch is deployed by
 `.github/workflows/ci.yml` (tests → build → SSH → `deploy/docker-deploy.sh`, health check + rollback).
+**Do not push while an `ops.yml` evals run is in progress:** the deploy rebuilds the container and kills it.
 
 ## What the user asked for (this phase)
 1. **Confirmation buttons**: when the assistant needs approval, show ✅/❌ buttons (web + Telegram). Pressing
    approve must execute the action immediately — no more "asks for confirmation and never does it".
 2. **Edit instead of duplicate**: "add X" then "change it" must update X, not create a second task.
 3. **Human-like follow-ups and planning**: know where the user is during the day (home / company / university /
-   on the way), learn how they study, plan backwards from deadlines, and stop robotic "block started/ended" pings.
-4. **Try other GapGPT models** for the best quality/price.
-5. Read the user's real chats (exported DB at `/Users/ali/Documents/Projects/Agent-New/data/peygir-database-2026-11-02`
-   on the user's Mac). The cloud session could not reach the Mac (no Remote Control folder shared), and the web
-   API needs `APP_PASSWORD`. Locally: open that SQLite file and review `messages` to find more failure cases.
+   on the way), learn how they study, plan backwards from deadlines, stop robotic "block started/ended" pings.
+4. **Try other GapGPT models** for the best quality/price (see "Model comparison" below).
+5. Read the user's real chats. The export is on the user's Mac at
+   `/Users/ali/Documents/Projects/Agent-New/data/peygir-database-2026-11-02`. The cloud session could not reach the
+   Mac (no Remote Control folder shared) and the web API needs `APP_PASSWORD`, so the real chats were NOT reviewed
+   yet. **Next step locally:** open that SQLite file, read `messages` (role, content, meta.action_log) and look for:
+   repeated "تأیید" loops, duplicate tasks (same title in `tasks`), proactive messages the user ignored or disliked,
+   wrong dates. Add each failure as an eval scenario in `backend/app/evals.py`.
 
-## Design (see code for details)
-- `backend/app/pending.py` + `PendingAction` table: proposals that wait for a button press.
-  - Delete tools (`delete_task`, `delete_event`, `delete_recurring_event`, …) no longer ask verbally: the call
-    becomes a pending action, the reply shows buttons; approve runs the stored call with `trusted=True` under the
-    original turn id (so "برگردون" still works).
-  - `ask_approval(summary, actions=[{tool, args}])` lets the model bundle concrete tool calls for approval.
-  - A plain "آره/باشه/اوکی/بله" (or "نه/ولش کن") reply to a message with pending actions is handled by the server
-    without the LLM (`pending.quick_answer`).
-  - Web: `POST /api/pending/{id}/approve|reject`; Telegram callback `pa:<id>:y|n`.
-- Duplicates: `add_task` / `add_event` refuse a near-identical open item and point at it (`allow_duplicate=true`
-  to force); `update_task` / `complete_task` / `delete_task` accept `task` (title) instead of `task_id`;
-  action logs in history carry titles; the context lists recently created/changed items.
-- Planning: see `backend/app/daymap.py` (where the user is during the day, free windows with location) and the
-  deadline plan returned by `add_task`/`update_task` (`plan` field: scheduled sessions before the deadline, fits?).
-  Block start/end pings are replaced by "session" nudges (first block of a work session only, with day context).
+## What was built
+### 1. Approval buttons — `backend/app/pending.py`, table `pending_actions`
+- Delete tools (`delete_task`, `delete_event`, `delete_recurring_event`, `delete_habit`) call
+  `journal.confirm_guard`; in a chat turn that returns `needs_confirmation`, and `tools.execute` turns it into a
+  `PendingAction` (the exact tool + args) via `tools._propose`.
+- New core tool `ask_approval(summary, actions=[{tool, args}])` (in `agent/tools_more.py`): the model bundles concrete
+  tool calls for approval (bulk changes, a new plan, ambiguous requests). Validated up front (tool exists, not
+  read-only, required args, ids exist).
+- After the turn, `core.handle_user_message` puts `meta.confirm = {status, summary, items}` on the assistant
+  message and links the pending rows to it (`pending.attach`).
+- Answering: web `POST /api/messages/{id}/approve|reject` (ConfirmCard in `frontend/src/pages/Chat.tsx`), Telegram
+  inline buttons `pa:<message_id>:y|n` (`outbox.buttons_for`, `telegram._handle_callback`), or a bare typed
+  «آره/باشه/اوکی» / «نه/ولش کن» (`pending.quick_answer`, handled before the LLM in `handle_user_message`).
+- `pending.resolve` runs the stored calls with `trusted=True` under the original message's turn id (so «برگردون»
+  undoes them), stores a short "✅ انجام شد: …" message with an action_log, updates the card state. No LLM call.
+- A new proposal expires older unanswered ones; proposals expire after 24h. Pending ones are listed in the
+  context ("Waiting for the user's ✅/❌ button") so the model does not redo or re-ask them.
+- Prompt rule (PERSONA): act, don't ask for normal adds/edits; never end with «ثبتش کنم؟»; use ask_approval for
+  deletions / big changes / real ambiguity.
+
+### 2. Edit instead of duplicate — `backend/app/match.py`
+- `add_task` / `add_event` refuse a near-identical open item (similar title; same week for tasks, ±36h for
+  events; differing numbers like «جلسه ۸»/«جلسه ۹» or each title having extra words = different) and return
+  `existing_task`/`existing_event` + instruction to call update instead; `allow_duplicate=true` forces. UI calls
+  (`ctx.trusted`) skip the guard.
+- `update_task` / `complete_task` / `delete_task` accept `task=<title>`; `update_event` / `delete_event` accept
+  `event=<title>` (fuzzy match, ambiguity → error listing candidates).
+- History notes (`[actions done: …]`) now carry titles; context has "Recently added/changed" (journal, 48h).
+- Prompt rule: corrections are edits.
+
+### 3. Day-aware, human planning — `backend/app/daymap.py`, `planner.py`, `followups.py`, `agent/proactive.py`
+- `daymap.day_map(s, date)`: segments of the day — getting ready, trips (from `places.plan_trips`), classes/work/
+  events with places, planned work, free windows with where the user is. `where_now`, `busy_now`, `place_at`,
+  `context_lines` (in every prompt: "The user's day").
+- `tools.deadline_plan`: `add_task`/`update_task` (due or estimate changed) re-plan immediately (horizon up to 21
+  days) and return `plan = {needs_minutes, planned_minutes, fits, sessions:["tue 10-20 20:00-21:30 @خانه"…],
+  warning}`. `Ctx.plan_days` keeps the end-of-turn re-plan on the same horizon.
+- Planner: block length = learned session length per category (`insights.study_profile` /
+  `session_minutes`, from WorkLog, ≥6 sessions), preferred hours = pref `study_hours` ("20:00-23:30,…") over the
+  learned peak hours. `update_preferences(study_hours=…)` parses Persian ranges (`timeutil.parse_ranges`).
+- Follow-ups: `_session_nudges` — one `block_start` per work session (consecutive blocks), max 1/2/4 per day by
+  intensity, skips short non-urgent sessions; no more `block_end` pings (pending ones are cancelled). Reminders in
+  `DEFER_WHILE_BUSY` wait until the current class/meeting/getting-ready ends (`daymap.busy_now`).
+- Proactive texts: session nudge says what/why now/until when (with day map) and never says «بلوک»; morning brief
+  uses the day map; evening review lists today's planned work and asks how much got done (to log it).
+
+### 4. Evals — `backend/app/evals.py` (16 scenarios)
+New: `edit`, `correction`, `change`, `deadline`, `bulk`, `act`; `delete` now checks the buttons. Run on the server:
+GitHub → Actions → Ops → task `evals`, models comma-separated, scenarios optional. Results appear in the run summary.
+
+## Model comparison (filled in from the ops runs)
+See the bottom of this file ("Model comparison results").
 
 ## How to run locally
 ```
-cd backend && python -m venv .venv && . .venv/bin/activate && pip install -r ../requirements.txt -r requirements-dev.txt
-pytest -q                       # all tests
+cd backend && python -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt -r requirements-dev.txt
+pytest -q                       # 148+ tests
 cd ../frontend && npm ci && npm run build
+python -m app.evals --models gemini-3.1-flash-lite,deepseek-v4-flash --scenarios edit,correction,deadline
 ```
-Evals against real models: `python -m app.evals --models gemini-3.1-flash-lite,deepseek-v4-flash` (needs
-`LLM_API_KEY`), or the manual GitHub workflow `ops.yml` (task `evals`). Logs are public: print numbers only.
 
-## Status
-See the bottom of this file ("Progress log") — updated as work lands.
+## Open ideas / next steps
+- Review the real chats (see 5 above) and turn every failure into an eval scenario.
+- Commute time as light-task time (vocab on the metro) — day map already knows the trips and their mode.
+- Per-weekday "light days" from `study_profile` could lower the daily focus cap on those days.
+- Quick-reply chips for questions with options (beyond yes/no).
 
 ## Progress log
-- (in progress) confirm buttons, duplicate guard, planning/daymap, evals.
+- 7a2cc98 approval buttons + duplicate guard (deployed)
+- (next) day map, deadline plans, study pattern, session nudges (deployed)
+- d088ffe evals for the new behaviour (deployed)
+- e869fa0 approval card polish + README (local until evals finish)

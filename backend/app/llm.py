@@ -7,6 +7,7 @@ streaming, embeddings, speech-to-text and text-to-speech.
 from __future__ import annotations
 
 import base64
+import re
 import logging
 import time
 from dataclasses import dataclass, field
@@ -234,6 +235,9 @@ class LLM:
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
+            if re.match(r"gpt-6", model):
+                # these reason by default, and then refuse function tools on /chat/completions
+                kwargs["reasoning_effort"] = "none"
         if on_delta is not None and self.settings.llm_streaming:
             try:
                 return await self._stream(kwargs, on_delta)

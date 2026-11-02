@@ -68,8 +68,24 @@ Last updated: 2026-11-02. Branch: `claude/charming-lovelace-b7blod`. Every push 
 New: `edit`, `correction`, `change`, `deadline`, `bulk`, `act`; `delete` now checks the buttons. Run on the server:
 GitHub → Actions → Ops → task `evals`, models comma-separated, scenarios optional. Results appear in the run summary.
 
-## Model comparison (filled in from the ops runs)
-See the bottom of this file ("Model comparison results").
+## Model comparison (ops evals, 2026-11-02, 14 scenarios / 40 checks, on the server)
+| model | score | cost | time |
+|---|---|---|---|
+| deepseek-v4-flash (**new default: chat + fast**) | 39/40 | $0.038 | 168 s |
+| gpt-4.1-mini (fallback 1) | 39/40 | $0.070 | 183 s |
+| gpt-5.6-luna | 39/40 | $0.055 | 326 s |
+| gpt-5-mini | 39/40 | $0.107 | 339 s |
+| gemini-3.5-flash | 39/40 | $0.506 | 210 s |
+| gemini-3.1-flash-lite (old default, fallback 2) | 38/40 | $0.077 | 220 s |
+| claude-haiku-5-5 | 38/40 | $0.052 | 304 s |
+| qwen3-235b-a22b | 35/40 | $0.046 | 412 s |
+| gpt-6-luna | invalid: refused tools (fixed since: `reasoning_effort=none` for gpt-6*) | | |
+| deepseek-v4-pro | 403 — not enabled on this GapGPT account | | |
+
+Most common miss: "bulk" — several models move many tasks directly instead of calling ask_approval.
+`prefs.apply_model_defaults` (MODEL_DEFAULTS_VERSION 3) switches installs that still use an earlier recommended
+model; a model the user picked in Settings is kept. The eval report now prints the tools and resulting
+tasks/events of every failed scenario (synthetic data only).
 
 ## How to run locally
 ```
@@ -86,7 +102,9 @@ python -m app.evals --models gemini-3.1-flash-lite,deepseek-v4-flash --scenarios
 - Quick-reply chips for questions with options (beyond yes/no).
 
 ## Progress log
+- 2026-11-02: everything below is committed and pushed (deployed by CI).
 - 7a2cc98 approval buttons + duplicate guard (deployed)
 - (next) day map, deadline plans, study pattern, session nudges (deployed)
 - d088ffe evals for the new behaviour (deployed)
-- e869fa0 approval card polish + README (local until evals finish)
+- e869fa0 approval card polish + README
+- then: human deadline reminders / check-ins, gpt-6 tool fix, eval report details, deepseek-v4-flash default

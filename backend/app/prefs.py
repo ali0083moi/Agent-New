@@ -73,13 +73,19 @@ DEFAULTS: dict[str, Any] = {
     "ics_include": ["classes", "events", "blocks", "deadlines", "trips"],
 }
 
-# cheap models that did best in the evals (python -m app.evals, Oct 2026): written once into the settings of
-# installs that still use the old defaults from .env, unless the user already picked models in Settings
-MODEL_DEFAULTS_VERSION = 2
+# cheap models that did best in the evals (python -m app.evals, Nov 2026: deepseek-v4-flash 39/40 at $0.038, the
+# lowest cost and fastest). Written once into the settings; a setting is only replaced while it still holds an
+# earlier recommendation (or is empty) — a model the user picked in Settings is kept.
+MODEL_DEFAULTS_VERSION = 3
 RECOMMENDED_MODELS = {
-    "llm_chat_model": "gemini-3.1-flash-lite",
+    "llm_chat_model": "deepseek-v4-flash",
     "llm_fast_model": "deepseek-v4-flash",
-    "llm_fallback_models": "deepseek-v4-flash,gpt-4.1-mini",
+    "llm_fallback_models": "gpt-4.1-mini,gemini-3.1-flash-lite",
+}
+EARLIER_RECOMMENDED = {
+    "llm_chat_model": {"gemini-3.1-flash-lite"},
+    "llm_fast_model": {"deepseek-v4-flash"},
+    "llm_fallback_models": {"deepseek-v4-flash,gpt-4.1-mini"},
 }
 
 # app state keys (not user preferences)
@@ -126,9 +132,11 @@ def apply_model_defaults(s: Session) -> dict[str, str]:
     if int(get("model_defaults_version", 0, s=s) or 0) >= MODEL_DEFAULTS_VERSION:
         return {}
     changed = {}
-    if not get("llm_chat_model", s=s) and not get("llm_fast_model", s=s):
+    chat = get("llm_chat_model", s=s)
+    if not chat or chat in EARLIER_RECOMMENDED["llm_chat_model"]:  # the user didn't pick their own chat model
         for key, value in RECOMMENDED_MODELS.items():
-            if not get(key, s=s):
+            cur = get(key, s=s)
+            if (not cur or cur in EARLIER_RECOMMENDED.get(key, ())) and cur != value:
                 set(key, value, s=s)
                 changed[key] = value
     set("model_defaults_version", MODEL_DEFAULTS_VERSION, s=s)

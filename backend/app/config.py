@@ -18,7 +18,7 @@ class Settings(BaseSettings):
     # --- LLM (GapGPT, OpenAI-compatible) ---
     gapgpt_api_key: str = ""
     gapgpt_base_url: str = "https://api.gapgpt.app/v1"
-    chat_model: str = "gemini-3.1-flash-lite"  # best score + cheap in the evals (Oct 2026)
+    chat_model: str = "deepseek-v4-flash"  # best score, cheapest and fastest in the evals (Nov 2026)
     fast_model: str = "deepseek-v4-flash"
     vision_model: str = "gpt-4.1"
     # stronger, pricier model only for hard jobs: emails to professors, SOP/CV, weekly planning & report, IELTS grading

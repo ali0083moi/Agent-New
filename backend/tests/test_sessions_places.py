@@ -334,10 +334,23 @@ def test_bad_ids_inside_lists_are_dropped():
 
 def test_recommended_models_applied_once_unless_user_chose():
     with session() as s:
-        assert prefs.apply_model_defaults(s)["llm_chat_model"] == "gemini-3.1-flash-lite"
+        assert prefs.apply_model_defaults(s)["llm_chat_model"] == "deepseek-v4-flash"
         prefs.set("llm_chat_model", "gpt-4.1", s=s)  # the user changes it back in Settings
         assert prefs.apply_model_defaults(s) == {}
         assert prefs.get("llm_chat_model", s=s) == "gpt-4.1"
+
+
+def test_earlier_recommendation_is_upgraded_but_not_a_user_choice():
+    with session() as s:
+        prefs.set("model_defaults_version", 2, s=s)
+        prefs.set("llm_chat_model", "gemini-3.1-flash-lite", s=s)
+        prefs.set("llm_fast_model", "deepseek-v4-flash", s=s)
+        prefs.set("llm_fallback_models", "deepseek-v4-flash,gpt-4.1-mini", s=s)
+        changed = prefs.apply_model_defaults(s)
+        assert changed == {"llm_chat_model": "deepseek-v4-flash", "llm_fallback_models": "gpt-4.1-mini,gemini-3.1-flash-lite"}
+        prefs.set("model_defaults_version", 2, s=s)
+        prefs.set("llm_chat_model", "gpt-4.1", s=s)
+        assert prefs.apply_model_defaults(s) == {}
 
 
 def test_user_choice_is_kept():

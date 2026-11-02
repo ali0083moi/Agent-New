@@ -358,6 +358,10 @@ async def run_scenario(sc: Scenario, model: str) -> dict[str, Any]:
         checks = [("اجرا بدون خطا", False)]
     elapsed = time.monotonic() - started
     with session() as s:
+        # synthetic scenario data only — safe to show in the (public) report
+        state = [f"task «{t.title}» due {timeutil.iso(t.due_at) if t.due_at else '-'} est {t.estimated_minutes}"
+                 for t in s.query(Task).limit(8)]
+        state += [f"event «{e.title}» {timeutil.iso(e.start_at)}" for e in s.query(Event).limit(4)]
         cost = s.query(func.coalesce(func.sum(LlmUsage.cost_usd), 0.0)).scalar() or 0.0
         toks = s.query(func.coalesce(func.sum(LlmUsage.prompt_tokens + LlmUsage.completion_tokens), 0)).scalar() or 0
         served = sorted({u.model for u in s.query(LlmUsage).filter(LlmUsage.ok.is_(True)).all()})
@@ -374,6 +378,7 @@ async def run_scenario(sc: Scenario, model: str) -> dict[str, Any]:
         "tokens": int(toks),
         "replies": run.replies,
         "tools": run.tools,
+        "state": state,
         "error": error,
     }
 
@@ -402,6 +407,8 @@ def render(results: list[dict[str, Any]]) -> str:
         bad = [c["name"] for c in r["checks"] if not c["ok"]]
         if bad or r["error"]:
             lines.append(f"- `{r['model']}` / {r['title']}: " + "، ".join(bad) + (f" — خطا: {r['error']}" if r["error"] else ""))
+            lines.append(f"  - tools: {', '.join(dict.fromkeys(r['tools']))}")
+            lines += [f"  - {x}" for x in r.get("state", [])]
     return "\n".join(lines) + "\n"
 
 

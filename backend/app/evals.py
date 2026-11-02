@@ -48,6 +48,7 @@ class Scenario:
 class Run:
     replies: list[str] = field(default_factory=list)
     tools: list[str] = field(default_factory=list)
+    metas: list[dict[str, Any]] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------- helpers
@@ -78,6 +79,21 @@ def _seed_busy_week() -> None:
 def _seed_book_task() -> None:
     with session() as s:
         s.add(Task(title="خرید کتاب کمبریج ۱۸", category="language", estimated_minutes=30))
+
+
+def _seed_recent_task() -> None:
+    """A task the user added a minute ago through the assistant (so it is in the 'recently added' list)."""
+    from .agent import tools
+
+    with session() as s:
+        tools.REGISTRY["add_task"].fn(s, ctx=tools.Ctx(turn_id="seed"), title="ارسال گزارش پروژه ماشین",
+                                      due="2026-10-22 18:00", estimated_minutes=120, category="work")
+
+
+def _seed_week_tasks() -> None:
+    with session() as s:
+        for title, day in (("تمرین سری ۳ آمار", 20), ("خلاصه فصل ۴ مدیریت", 21), ("ویدیوی دوره React", 22)):
+            s.add(Task(title=title, category="university", estimated_minutes=60, due_at=datetime(2026, 10, day, 20, 0)))
 
 
 def _seed_habit() -> None:
@@ -167,9 +183,81 @@ def _jalali_checks(run: Run) -> list[Check]:
 def _delete_checks(run: Run) -> list[Check]:
     with session() as s:
         left = s.query(Task).count()
+    first = run.metas[0] if run.metas else {}
     return [
-        ("در نوبت اول تأیید خواست", "delete_task" in run.tools and "؟" in run.replies[0]),
+        ("در نوبت اول دکمه تأیید نشان داده شد", (first.get("confirm") or {}).get("status") == "pending"),
         ("بعد از «آره» حذف شد", left == 0),
+    ]
+
+
+def _one_task(title_part: str) -> list[Task]:
+    with session() as s:
+        return [t for t in s.query(Task).all() if title_part in t.title]
+
+
+def _edit_checks(run: Run) -> list[Check]:
+    ts = _one_task("گزارش")
+    return [
+        ("تسک تکراری ساخته نشد", len(ts) == 1),
+        ("ددلاین به شنبه ۱۲:۰۰ تغییر کرد", len(ts) == 1 and ts[0].due_at == datetime(2026, 10, 24, 12, 0)),
+        ("پاسخ فارسی و تمیز", _persian(run.replies[-1]) and _clean(run.replies[-1])),
+    ]
+
+
+def _correction_checks(run: Run) -> list[Check]:
+    with session() as s:
+        evs = s.query(Event).all()
+        tasks = s.query(Task).count()
+    return [
+        ("فقط یک جلسه ثبت شده", len(evs) == 1 and tasks == 0),
+        ("ساعت جلسه ۱۸:۰۰ فردا شد", len(evs) == 1 and evs[0].start_at == datetime(2026, 10, 20, 18, 0)),
+    ]
+
+
+def _change_after_add_checks(run: Run) -> list[Check]:
+    ts = _one_task("RAG")
+    return [
+        ("تسک تکراری ساخته نشد", len(ts) == 1),
+        ("ددلاین جمعه شد", len(ts) == 1 and ts[0].due_at is not None and ts[0].due_at.date() == datetime(2026, 10, 23).date()),
+        ("زمان ۴ ساعت شد", len(ts) == 1 and ts[0].estimated_minutes == 240),
+    ]
+
+
+def _deadline_plan_checks(run: Run) -> list[Check]:
+    import re as _re
+
+    ts = _one_task("شبکه")
+    with session() as s:
+        blocks = (s.query(PlannedBlock).filter(PlannedBlock.task_id == ts[0].id).all() if len(ts) == 1 else [])
+    reply = run.replies[-1]
+    return [
+        ("تسک با ددلاین چهارشنبه ۱۸:۰۰ و ۵ ساعت", len(ts) == 1 and ts[0].due_at == datetime(2026, 10, 21, 18, 0)
+         and ts[0].estimated_minutes == 300),
+        ("زمان کار قبل از ددلاین چیده شد", sum((b.end_at - b.start_at).total_seconds() for b in blocks) >= 300 * 60),
+        ("در جواب گفت کی رویش کار کند", bool(_re.search(r"(امروز|امشب|فردا|سه‌?شنبه|چهارشنبه|دوشنبه)", reply))
+         and bool(_re.search(r"[0-9۰-۹]{1,2}[:٫:]?[0-9۰-۹]{0,2}", reply))),
+        ("نپرسید «ثبت کنم؟»", not _re.search(r"(ثبت|اضافه|برنامه‌?ریزی) کنم\s*؟", reply)),
+    ]
+
+
+def _bulk_checks(run: Run) -> list[Check]:
+    with session() as s:
+        dues = [t.due_at for t in s.query(Task).all()]
+    first = run.metas[0] if run.metas else {}
+    return [
+        ("برای تغییر گروهی دکمه تأیید نشان داد", (first.get("confirm") or {}).get("status") == "pending"),
+        ("بعد از «آره» همه منتقل شدند", len(dues) == 3 and all(d is not None and d >= datetime(2026, 10, 26) for d in dues)),
+    ]
+
+
+def _act_checks(run: Run) -> list[Check]:
+    import re as _re
+
+    with session() as s:
+        n = s.query(Task).count() + s.query(Event).count()
+    return [
+        ("ثبت شد بدون اینکه اجازه بگیرد", n >= 1),
+        ("سؤال «ثبت کنم؟» نپرسید", not _re.search(r"(ثبت|اضافه|یادداشت) (کنم|بکنم)\s*؟", run.replies[-1])),
     ]
 
 
@@ -223,6 +311,17 @@ SCENARIOS = [
     Scenario("exam", "برنامه امتحان", ["امتحان ریاضی ۲ ده آبان ساعت ۹ صبحه. حدود ۱۰ ساعت مطالعه لازم دارم، "
                                        "فصل‌های مشتق، انتگرال و سری‌ها. برام برنامه بچین"], _exam_checks),
     Scenario("chitchat", "گپ ساده", ["سلام! خوبی؟"], _chitchat_checks),
+    Scenario("edit", "ویرایش به‌جای تسک تکراری", ["گزارش پروژه ماشین رو بنداز برای شنبه ساعت ۱۲"], _edit_checks,
+             _seed_recent_task),
+    Scenario("correction", "اصلاح ساعت جلسه", ["فردا ساعت ۵ عصر با مدیرم جلسه دارم", "ببخشید ساعتش ۶ هست نه ۵"],
+             _correction_checks),
+    Scenario("change", "تغییر بعد از ثبت", ["تا پنجشنبه باید مقاله RAG رو بخونم، حدود ۳ ساعت",
+                                            "نه ددلاینش جمعه‌ست، و حدود ۴ ساعت طول می‌کشه"], _change_after_add_checks),
+    Scenario("deadline", "برنامه تا ددلاین", ["تا چهارشنبه ساعت ۶ عصر باید پروژه درس شبکه رو تحویل بدم، حدود ۵ ساعت کار داره"],
+             _deadline_plan_checks),
+    Scenario("bulk", "تغییر گروهی با دکمه تأیید", ["این هفته خیلی شلوغم، همه کارهای این هفته رو بنداز برای هفته بعد همون روز و ساعت",
+                                                  "آره"], _bulk_checks, _seed_week_tasks),
+    Scenario("act", "ثبت بدون اجازه گرفتن", ["فردا باید برم بانک کارت جدید بگیرم"], _act_checks),
 ]
 
 
@@ -247,6 +346,7 @@ async def run_scenario(sc: Scenario, model: str) -> dict[str, Any]:
                 atts.append(core.Attachment("image", (EVAL_DIR / sc.image).read_bytes(), "image/png", sc.image))
             _, reply = await core.handle_user_message(turn, "web", atts, model=model)
             run.replies.append(reply["content"])
+            run.metas.append(reply.get("meta") or {})
             run.tools += [a["tool"] for a in reply["meta"].get("actions", [])]
             with session() as s:
                 # include tools hidden from chips (read-only ones)

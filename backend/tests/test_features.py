@@ -519,6 +519,30 @@ def test_eval_harness_runs_with_scripted_model(tmp_path, fake_llm):
     assert "model-x" in report and "2/2" in report
 
 
+REAL_CHAT_SCENARIOS = ["deadline_list", "midterm_fix", "delete_wrong", "done_fuzzy", "dnd", "quiet_now", "skip_class",
+                       "project_task", "wellbeing", "ask_tonight"]
+
+
+@pytest.mark.parametrize("name", REAL_CHAT_SCENARIOS)
+def test_real_chat_scenarios_fail_when_the_model_does_nothing(name):
+    """Seeds and checks run without a model, and a do-nothing reply does not pass (each one catches its bug)."""
+    from app import evals
+
+    sc = next(s for s in evals.SCENARIOS if s.name == name)
+    sc.seed()
+    checks = sc.checks(evals.Run(replies=["باشه علی، حواسم هست و همه‌چیز رو درست می‌کنم"], metas=[{}]))
+    assert checks and not all(ok for _, ok in checks), checks
+
+
+def test_eval_clean_flags_tool_names_and_raw_errors():
+    from app import evals
+
+    assert evals._clean("آفرین، تایمر مطالعه شروع شد")
+    assert not evals._clean("بگو تا `start_focus` رو بزنم")
+    assert not evals._clean('{"tool_names":["log_work"]} امروز')
+    assert not evals._clean("(sqlite3.IntegrityError) FOREIGN KEY constraint failed")
+
+
 
 # ---------------------------------------------------------------- robustness (bugs seen in production)
 def test_add_task_survives_bad_model_arguments():

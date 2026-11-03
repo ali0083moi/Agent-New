@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import re
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -23,10 +24,10 @@ from typing import Any, Callable
 
 from sqlalchemy import func
 
-from . import db, prefs, timeutil
+from . import db, followups, prefs, timeutil
 from .config import get_settings
-from .db import (Event, Habit, HabitLog, IeltsScore, LlmUsage, Message, PlannedBlock, RecurringEvent, Task,
-                 session)
+from .db import (Event, Followup, Habit, HabitLog, IeltsScore, LlmUsage, Message, PlannedBlock, Project,
+                 RecurringEvent, Task, session)
 
 FIXED_NOW = datetime(2026, 10, 19, 10, 0)
 EVAL_DIR = Path(__file__).resolve().parents[1] / "evals"
@@ -57,8 +58,17 @@ def _persian(text: str) -> bool:
     return fa >= max(5, len(text) * 0.3)
 
 
+LEAKS = ("[actions done", "[proactive", "SYSTEM TRIGGER", '{"tool_names"', "no tools exposed", "IntegrityError",
+         "sqlalche", "Traceback")
+
+
 def _clean(text: str) -> bool:
-    return "[actions done" not in text and "[proactive" not in text and "SYSTEM TRIGGER" not in text
+    """No internal text: markers, raw errors or tool names (real chats showed `plan_schedule`, `start_focus`...)."""
+    from .agent import tools
+
+    if any(x in text for x in LEAKS):
+        return False
+    return not any(re.search(rf"\b{name}\b", text) for name in tools.REGISTRY if "_" in name)
 
 
 def _seed_ielts_class() -> None:
@@ -293,6 +303,176 @@ def _chitchat_checks(run: Run) -> list[Check]:
             ("ابزار بی‌دلیل صدا زده نشد", not [t for t in run.tools if t not in ("get_agenda", "list_tasks")])]
 
 
+# ------------------------------------------- failures from the user's real chats (Oct 20 – Nov 2, 2026)
+# Clock: Monday 2026-10-19 10:00 = ۲۷ مهر ۱۴۰۵. ۱ آبان = 2026-10-23, ۹ آذر = 2026-11-30 (Monday).
+MIDTERM_DAY = datetime(2026, 11, 30)
+
+
+def _seed_midterm_wrong() -> None:
+    with session() as s:
+        s.add(Event(title="میانترم اتوماتا", kind="exam", start_at=MIDTERM_DAY.replace(hour=9),
+                    end_at=MIDTERM_DAY.replace(hour=10)))
+
+
+def _seed_midterm_twice() -> None:
+    _seed_midterm_wrong()
+    with session() as s:
+        s.add(Event(title="میانترم اتوماتا", kind="exam", start_at=MIDTERM_DAY.replace(hour=16, minute=30),
+                    end_at=MIDTERM_DAY.replace(hour=18)))
+
+
+def _seed_minilab() -> None:
+    with session() as s:
+        s.add(Task(title="مینی‌لب: پیاده‌سازی Dashboard Widget", category="university", estimated_minutes=90,
+                   due_at=datetime(2026, 10, 20, 9, 0)))
+        s.add(Task(title="تمرین برنامه‌سازی موبایل", category="university", estimated_minutes=120,
+                   due_at=datetime(2026, 10, 30, 23, 59)))
+
+
+def _seed_pending_reminders() -> None:
+    """A task with a reminder and a check-in due in the next hours (what kept pinging the user)."""
+    with session() as s:
+        t = Task(title="تمرین اتوماتا", category="university", estimated_minutes=90, due_at=datetime(2026, 10, 19, 23, 59))
+        s.add(t)
+        s.flush()
+        s.add(Followup(kind="deadline", due_at=datetime(2026, 10, 19, 10, 40), task_id=t.id, dedupe_key="eval:deadline"))
+        s.add(Followup(kind="task_checkin", due_at=datetime(2026, 10, 19, 12, 30), task_id=t.id,
+                       dedupe_key="eval:checkin"))
+
+
+def _seed_today_class() -> None:
+    with session() as s:
+        s.add(RecurringEvent(title="مفاهیم پیشرفته کامپیوتر", kind="university_class", weekdays=["sat", "mon"],
+                             start_time="16:30", end_time="18:00", followup=True))
+    with session() as s:
+        followups.generate(s, FIXED_NOW)
+
+
+def _seed_car_project() -> None:
+    with session() as s:
+        s.add(Project(name="tahami supercars", aliases=["پروژه ماشین"], category="work"))
+
+
+def _due_kinds(at: datetime) -> list[str]:
+    with session() as s:
+        return [f.kind for f in followups.due_now(s, at)]
+
+
+def _deadline_list_checks(run: Run) -> list[Check]:
+    with session() as s:
+        tasks = s.query(Task).all()
+        evs = s.query(Event).all()
+
+    def items(key: str) -> list[datetime]:
+        return [t.due_at for t in tasks if key in t.title and t.due_at] + [e.start_at for e in evs if key in e.title]
+
+    def due_on(key: str, day: int, month: int = 10) -> bool:
+        got = items(key)
+        return len(got) == 1 and got[0].date() == datetime(2026, month, day).date() and got[0].hour == 23
+
+    midterm = items("اتوماتا")
+    return [
+        ("مدار: ۲۹ مهر = چهارشنبه ۲۱ اکتبر ۲۳:۵۹", due_on("مدار", 21)),
+        ("مینی‌لب: ۱ آبان = جمعه ۲۳ اکتبر ۲۳:۵۹", due_on("مینی", 23)),
+        ("کوییز هوش: ۳ آبان = یکشنبه ۲۵ اکتبر ۲۳:۵۹", due_on("هوش", 25)),
+        ("میانترم اتوماتا: ۹ آذر ۱۶:۳۰، فقط یک بار", len(midterm) == 1
+         and midterm[0] == MIDTERM_DAY.replace(hour=16, minute=30)),
+        ("پاسخ فارسی و تمیز", _persian(run.replies[-1]) and _clean(run.replies[-1])),
+    ]
+
+
+def _midterm_fix_checks(run: Run) -> list[Check]:
+    with session() as s:
+        evs = s.query(Event).all()
+    return [
+        ("میانترم دوم ساخته نشد", len(evs) == 1),
+        ("ساعت همان میانترم ۱۶:۳۰ شد", len(evs) == 1 and evs[0].start_at == MIDTERM_DAY.replace(hour=16, minute=30)),
+    ]
+
+
+def _delete_wrong_checks(run: Run) -> list[Check]:
+    with session() as s:
+        evs = s.query(Event).all()
+    return [
+        ("مورد اشتباه (۹ صبح) پاک شد", not [e for e in evs if e.start_at.hour == 9]),
+        ("مورد درست (۱۶:۳۰) ماند", len(evs) == 1 and evs[0].start_at.hour == 16),
+        ("بعد از «آره» دوباره تأیید نخواست", (run.metas[-1].get("confirm") or {}).get("status") != "pending"),
+    ]
+
+
+def _done_fuzzy_checks(run: Run) -> list[Check]:
+    with session() as s:
+        lab = s.query(Task).filter(Task.title.contains("Dashboard")).one()
+        other = s.query(Task).filter(Task.title.contains("تمرین")).one()
+    return [
+        ("مینی‌لب داشبورد انجام‌شده ثبت شد", lab.status == "done"),
+        ("تمرین موبایل دست نخورد", other.status != "done"),
+        ("پاسخ فارسی و تمیز", _persian(run.replies[-1]) and _clean(run.replies[-1])),
+    ]
+
+
+def _dnd_checks(run: Run) -> list[Check]:
+    early = _due_kinds(datetime(2026, 10, 19, 10, 45)) + _due_kinds(datetime(2026, 10, 19, 12, 35))
+    return [
+        ("تا ۱۳:۳۰ هیچ پیگیری‌ای نرفت", not early),
+        ("یادآوری‌ها حذف نشدند، بعد از ۱۳:۳۰ می‌آیند", bool(_due_kinds(datetime(2026, 10, 19, 13, 45)))),
+        ("پاسخ فارسی و تمیز", _persian(run.replies[-1]) and _clean(run.replies[-1])),
+    ]
+
+
+def _quiet_now_checks(run: Run) -> list[Check]:
+    reply = run.replies[-1]
+    early = _due_kinds(datetime(2026, 10, 19, 10, 45))
+    return [
+        ("حداقل تا یک ساعت پیگیری نرفت", not early),
+        ("جواب کوتاه و بدون سؤال", len(reply) <= 160 and "؟" not in reply),
+        ("پاسخ فارسی و تمیز", _persian(reply) and _clean(reply)),
+    ]
+
+
+def _skip_class_checks(run: Run) -> list[Check]:
+    after_class = _due_kinds(datetime(2026, 10, 19, 18, 30))
+    return [
+        ("بعد از کلاس نپرسید «تکلیف چی دادن؟»", "post_class" not in after_class),
+        ("نپرسید کدوم کلاس (امروز فقط یکی هست)", "کدوم" not in run.replies[-1] and "کدام" not in run.replies[-1]),
+        ("پاسخ فارسی و تمیز", _persian(run.replies[-1]) and _clean(run.replies[-1])),
+    ]
+
+
+def _project_task_checks(run: Run) -> list[Check]:
+    ts = _one_task("داکیومنت")
+    with session() as s:
+        pid = s.query(Project.id).scalar()
+    return [
+        ("تسک ثبت شد", len(ts) == 1),
+        ("به «پروژه ماشین» وصل شد", len(ts) == 1 and ts[0].project_id == pid),
+        ("ددلاین امشب", len(ts) == 1 and ts[0].due_at is not None and ts[0].due_at.date() == FIXED_NOW.date()
+         and ts[0].due_at.hour >= 21),
+        ("خطای خام به کاربر نشان داده نشد", _clean(run.replies[-1])),
+    ]
+
+
+def _wellbeing_checks(run: Run) -> list[Check]:
+    reply = run.replies[-1]
+    return [
+        ("حالش را پرسید", "؟" in reply),
+        ("سراغ کارها و ددلاین‌ها نرفت", not re.search(r"(ددلاین|تسک|تکلیف|برنامه‌ات)", reply)),
+        ("ابزار نوشتنی صدا زده نشد", not [t for t in run.tools if t not in ("get_agenda", "list_tasks", "remember")]),
+        ("پاسخ فارسی و تمیز", _persian(reply) and _clean(reply)),
+    ]
+
+
+def _ask_tonight_checks(run: Run) -> list[Check]:
+    with session() as s:
+        fs = s.query(Followup).filter(Followup.created_by == "agent").all()
+    tonight = [f for f in fs if f.due_at.date() == FIXED_NOW.date() and 20 <= f.due_at.hour <= 23]
+    return [
+        ("یادآوری برای امشب گذاشت", bool(tonight)),
+        ("ددلاین ساختگی نساخت", not [t for t in _one_task("") if t.due_at]),
+        ("پاسخ فارسی و تمیز", _persian(run.replies[-1]) and _clean(run.replies[-1])),
+    ]
+
+
 SCENARIOS = [
     Scenario("homework", "تکلیف بعد از کلاس", ["تازه از کلاس زبان اومدم، برای جلسه بعد یه رایتینگ تسک ۲ درباره تکنولوژی داد"],
              _homework_checks, _seed_ielts_class),
@@ -322,6 +502,27 @@ SCENARIOS = [
     Scenario("bulk", "تغییر گروهی با دکمه تأیید", ["این هفته خیلی شلوغم، همه کارهای این هفته رو بنداز برای هفته بعد همون روز و ساعت",
                                                   "آره"], _bulk_checks, _seed_week_tasks),
     Scenario("act", "ثبت بدون اجازه گرفتن", ["فردا باید برم بانک کارت جدید بگیرم"], _act_checks),
+    # from the real chats
+    Scenario("deadline_list", "لیست ددلاین با تاریخ شمسی", [
+        "۲۹ مهر ددلاین تمرین مدارالک\n۱ آبان ددلاین مینی‌لب موبایل\n۳ آبان رسوندن سوال های کوییز هوش\n"
+        "میانترم اتوماتا: ۹ آذر ۴:۳۰ تا ۶ عصر\n\nاینایی که ددلاینن ساعت ۱۱:۵۹ شب اون تاریخه مهلتشون"],
+        _deadline_list_checks),
+    Scenario("midterm_fix", "اصلاح ساعت به‌جای رویداد دوم", ["میانترم اتوماتا سر کلاس خودش برگزار میشه، ۴:۳۰ تا ۶ عصر"],
+             _midterm_fix_checks, _seed_midterm_wrong),
+    Scenario("delete_wrong", "پاک کردن مورد تکراری اشتباه", ["چرا ۹ آذر ۲ تا میانترم اتوماتا ثبت کردی؟ اشتباهه رو پاک کن",
+                                                           "اره حذفش کن"], _delete_wrong_checks, _seed_midterm_twice),
+    Scenario("done_fuzzy", "«تموم شد» با اسم متفاوت", ["داشبورد موبایل تموم شد کامل"], _done_fuzzy_checks, _seed_minilab),
+    Scenario("dnd", "مزاحم نشو تا ساعت مشخص", ["الان تا ۱:۳۰ میخوام ناهار بخورم و استراحت کنم\nمزاحمم نشو"], _dnd_checks,
+             _seed_pending_reminders),
+    Scenario("quiet_now", "ساکت شو، دارم کار می‌کنم", ["دهنتو ببند دارم اتوماتا مینویسم"], _quiet_now_checks,
+             _seed_pending_reminders),
+    Scenario("skip_class", "امروز نمیرم کلاس", ["امروز نمیرم کلاس"], _skip_class_checks, _seed_today_class),
+    Scenario("project_task", "تسک برای پروژه با اسم مستعار", [
+        "تا آخر امشب برای قسمت گیم پروژه ماشین باید یه داکیومنت دربیارم و به کارفرما تحویل بدم"],
+        _project_task_checks, _seed_car_project),
+    Scenario("wellbeing", "احوال‌پرسی، نه پیگیری کار", ["از صبح کم حالمو پرسیدی"], _wellbeing_checks, _seed_busy_week),
+    Scenario("ask_tonight", "شب ازم بپرس", ["یه ددلاین داده که گفت روی cw هست ولی نرفتم چک کنم، شب ازم بپرس بهت بگم"],
+             _ask_tonight_checks),
 ]
 
 

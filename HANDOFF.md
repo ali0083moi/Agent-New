@@ -68,6 +68,13 @@ Last updated: 2026-11-02. Branch: `claude/charming-lovelace-b7blod`. Every push 
 New: `edit`, `correction`, `change`, `deadline`, `bulk`, `act`; `delete` now checks the buttons. Run on the server:
 GitHub → Actions → Ops → task `evals`, models comma-separated, scenarios optional. Results appear in the run summary.
 
+2026-11-04: +10 scenarios from the real chats (26 total): `deadline_list` (Jalali list, 23:59), `midterm_fix`,
+`delete_wrong`, `done_fuzzy`, `dnd` («تا ۱:۳۰ مزاحمم نشو»), `quiet_now` («دهنتو ببند دارم … مینویسم»),
+`skip_class`, `project_task`, `wellbeing`, `ask_tonight`. `_clean` now also fails replies that show tool names,
+`{"tool_names"…}` or raw DB errors. `dnd` and `quiet_now` check `followups.due_now`, and no tool can mute follow-ups
+yet, so they are expected to fail until a do-not-disturb feature exists. `skip_class` needs the model to cancel that
+day's post_class follow-up.
+
 ## Model comparison (ops evals, 2026-11-02, 14 scenarios / 40 checks, on the server)
 | model | score | cost | time |
 |---|---|---|---|
@@ -96,7 +103,8 @@ python -m app.evals --models gemini-3.1-flash-lite,deepseek-v4-flash --scenarios
 ```
 
 ## Open ideas / next steps
-- Review the real chats (see 5 above) and turn every failure into an eval scenario.
+- Real chats reviewed 2026-11-04 (done → scenarios above). Gaps they exposed: a do-not-disturb-until tool
+  (mute follow-ups until a time / while the user works), a "skip today's class" action.
 - Commute time as light-task time (vocab on the metro) — day map already knows the trips and their mode.
 - Per-weekday "light days" from `study_profile` could lower the daily focus cap on those days.
 - Quick-reply chips for questions with options (beyond yes/no).

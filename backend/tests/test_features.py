@@ -219,6 +219,7 @@ def test_locked_block_survives_replan_and_missed_blocks_are_swept(clock):
 
 
 def test_rescue_analysis_and_followup(clock):
+    prefs.set("followup_style", "coach")
     prefs.set("max_focus_minutes_per_day", 240)
     with session() as s:
         s.add(Task(title="پروژه فوری", category="university", priority=1, estimated_minutes=600,
@@ -520,7 +521,7 @@ def test_eval_harness_runs_with_scripted_model(tmp_path, fake_llm):
 
 
 REAL_CHAT_SCENARIOS = ["deadline_list", "midterm_fix", "delete_wrong", "done_fuzzy", "dnd", "quiet_now", "skip_class",
-                       "project_task", "wellbeing", "ask_tonight"]
+                       "project_task", "wellbeing", "ask_tonight", "remind_in", "past_quiz"]
 
 
 @pytest.mark.parametrize("name", REAL_CHAT_SCENARIOS)

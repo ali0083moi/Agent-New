@@ -448,7 +448,7 @@ class TelegramBot:
         chat_id = cq.get("message", {}).get("chat", {}).get("id")
         if str(chat_id) != str(owner_chat_id()):
             return
-        m = re.fullmatch(r"(qr|sz|ud|pa):(\d+)(?::(\w+))?", data)
+        m = re.fullmatch(r"(qr|sz|ud|pa|ra):(\d+)(?::(\w+))?", data)
         if not m:
             return
         kind, mid, arg = m.group(1), int(m.group(2)), m.group(3)
@@ -492,6 +492,15 @@ class TelegramBot:
             text = snooze_message(mid, int(arg or 60))
             await ack("⏰ " + text)
             await drop_keyboard()
+        elif kind == "ra":
+            from .actions import reminder_action
+
+            text = reminder_action(mid, arg or "")
+            await ack(text[:180])
+            await drop_keyboard()
+            from . import outbox
+
+            await outbox.send("text", {"text": text})
         elif kind == "ud":
             from .actions import undo_message
 

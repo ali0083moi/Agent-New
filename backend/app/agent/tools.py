@@ -1096,20 +1096,107 @@ def get_stats(s: Session, ctx: Ctx, period: str = "today", start_date: str | Non
 # ------------------------------------------------------------------ follow-ups
 @tool(
     "schedule_followup",
-    "Schedule a custom reminder / check-in message to the user at a specific time "
-    "(e.g. 'remind me at 5 to call mom', or to check on something later).",
-    {"at": {"type": "string", "description": DT_HELP}, "note": {"type": "string", "description": "What to remind/ask."},
+    "Remind the user of something at a time: «یک ساعت دیگه یادم بنداز زنگ بزنم به رضا» → in_minutes=60; «ساعت ۵ "
+    "یادم بنداز» → at. Also for asking them about something later («شب ازم بپرس»). The message is sent word for "
+    "word: write note as the reminder itself, short, in Persian («زنگ بزنی به رضا»).",
+    {"in_minutes": {"type": "integer", "description": "Relative time: minutes from now (نیم ساعت دیگه = 30). The "
+                                                       "server computes the clock time — prefer this over at."},
+     "at": {"type": "string", "description": "Absolute time. " + DT_HELP},
+     "note": {"type": "string", "description": "What to remind/ask, as it should appear."},
      "task_id": {"type": "integer"}},
-    ["at", "note"],
+    ["note"],
     changes=("followups",),
 )
-def schedule_followup(s: Session, ctx: Ctx, at: str, note: str, task_id: int | None = None):
-    due = timeutil.parse_datetime(at)
-    f = Followup(kind="custom", due_at=due, note=note, task_id=task_id, created_by="agent")
+def schedule_followup(s: Session, ctx: Ctx, note: str, at: str | None = None, in_minutes: int | None = None,
+                      task_id: int | None = None):
+    now = timeutil.now()
+    if in_minutes is not None:
+        due = now + timedelta(minutes=max(1, int(in_minutes)))
+    elif at:
+        due = timeutil.parse_datetime(at)
+    else:
+        return {"error": "pass in_minutes (relative) or at (clock time)"}
+    if due < now - timedelta(minutes=1):
+        return {"error": f"{timeutil.iso(due)} is in the past (now {timeutil.iso(now)}); pass in_minutes or a later time"}
+    f = Followup(kind="custom", due_at=due, note=note.strip(), task_id=task_id, created_by="agent")
     s.add(f)
     s.flush()
     journal.created(s, ctx, f, f"یادآوری «{note[:40]}»")
-    return {"followup": serialize.followup(f)}
+    return {"followup": serialize.followup(f), "at_fa": timeutil.fa_datetime(due),
+            "say": "Confirm with the exact time from at_fa, e.g. «⏰ ساعت ۱۷:۱۵ یادت می‌ندازم …»."}
+
+
+@tool(
+    "do_not_disturb",
+    "The user wants no messages for a while («تا ۱:۳۰ مزاحمم نشو», «بذار بخوابم تا صبح», «دارم کار می‌کنم، پیام "
+    "نده», even rude: «خفه شو», «دهنتو ببند»). Until then no follow-ups are sent (their own reminders and «time to "
+    "leave» still are; the rest waits). No time given → 120 minutes; «تا صبح» → until = wake time. off=true ends it.",
+    {"until": {"type": "string", "description": "End time. " + DT_HELP},
+     "minutes": {"type": "integer", "description": "Or: for this many minutes from now."},
+     "off": {"type": "boolean", "description": "The user said they can be messaged again."}},
+    [],
+    changes=("followups",),
+)
+def do_not_disturb(s: Session, ctx: Ctx, until: str | None = None, minutes: int | None = None, off: bool = False):
+    now = timeutil.now()
+    if off:
+        journal.pref_change(s, ctx, "quiet_until", prefs.get("quiet_until", s=s))
+        prefs.set("quiet_until", None, s=s)
+        return {"quiet": False}
+    if until:
+        end = timeutil.parse_datetime(until)
+        if end <= now:  # «تا ۱:۳۰» said at 12:30 → 13:30, not 01:30 tonight
+            end = end + timedelta(hours=12) if end + timedelta(hours=12) > now else end + timedelta(days=1)
+    else:
+        end = now + timedelta(minutes=max(5, int(minutes) if minutes else 120))
+    journal.pref_change(s, ctx, "quiet_until", prefs.get("quiet_until", s=s))
+    prefs.set("quiet_until", timeutil.iso(end), s=s)
+    return {"quiet_until": timeutil.iso(end), "until_fa": timeutil.fa_datetime(end),
+            "say": "One short line, no question: e.g. «باشه، تا ۱۳:۳۰ پیامی نمی‌دم 🤫»."}
+
+
+@tool(
+    "skip_class",
+    "The user isn't going to a class session («امروز نمیرم کلاس», «کلاس نرفتم», «جلسه بعد کنسله»): no "
+    "after-class homework question and no «time to leave» reminder for that session. Without class/class_id the "
+    "class happening (or next) on that day is used.",
+    {"class_id": {"type": "integer"}, "class": {"type": "string", "description": "Class title (fuzzy)."},
+     "date": {"type": "string", "description": "YYYY-MM-DD, default today"}},
+    [],
+    changes=("followups",),
+)
+def skip_class(s: Session, ctx: Ctx, class_id: int | None = None, date: str | None = None, **kw):
+    now = timeutil.now()
+    day = timeutil.parse_datetime(date).date() if date else now.date()
+    start, end = timeutil.at(day, "00:00"), timeutil.at(day + timedelta(days=1), "00:00")
+    occ = [it for it in cal.class_occurrences(s, start, end)]
+    name = (kw.get("class") or "").strip()
+    if class_id:
+        occ = [it for it in occ if it.ref_id == int(class_id)]
+    elif name:
+        occ = [it for it in occ if name in it.title or match.similarity(name, it.title) >= 0.6]
+    elif len(occ) > 1:
+        later = [it for it in occ if it.end > now]
+        occ = later[:1] or occ[-1:]
+    if not occ:
+        return {"error": f"no class session found on {day.isoformat()}",
+                "classes_that_day": [it.title for it in cal.class_occurrences(s, start, end)]}
+    if len(occ) > 1:
+        return {"error": "several classes match; pass class_id", "candidates": [
+            {"class_id": it.ref_id, "title": it.title, "start": timeutil.iso(it.start)} for it in occ]}
+    it = occ[0]
+    key = f"post_class:{it.ref_id}:{it.start.date().isoformat()}"
+    f = s.query(Followup).filter(Followup.dedupe_key == key).first()
+    if f is None:  # not generated yet: a cancelled row keeps it from being generated
+        s.add(Followup(kind="post_class", due_at=it.end, dedupe_key=key, status="cancelled",
+                       recurring_event_id=it.ref_id, created_by="agent"))
+    elif f.status == "pending":
+        f.status = "cancelled"
+    for lf in s.query(Followup).filter(Followup.kind == "leave", Followup.status == "pending").all():
+        if (lf.payload or {}).get("start") == timeutil.iso(it.start) and (lf.payload or {}).get("title") == it.title:
+            lf.status = "cancelled"
+    s.flush()
+    return {"skipped": {"class_id": it.ref_id, "title": it.title, "start": timeutil.iso(it.start)}}
 
 
 @tool("list_followups", "List upcoming scheduled reminders/check-ins.", {"limit": {"type": "integer"}})
@@ -1222,7 +1309,9 @@ async def weekly_report(ctx: Ctx, week_offset: int = 0, project: str | None = No
     "update_preferences",
     "Change the user's preferences / routine settings. Keys: user_name, assistant_name, wake_time, sleep_time, "
     "work_start, work_end (productive window HH:MM), daily_brief_time, daily_review_time, weekly_report_day "
-    "(sat..fri), weekly_report_time, followup_intensity (low|normal|high), idle_checkin_hours, "
+    "(sat..fri), weekly_report_time, followup_style (reminder = only reminders, deadlines, leaving, after class, "
+    "morning brief | coach = also work-session nudges, idle/progress check-ins, rescue, evening review), "
+    "followup_intensity (low|normal|high), idle_checkin_hours, "
     "post_class_delay_minutes, block_nudges, auto_plan_daily, focus_block_minutes, break_minutes, "
     "max_focus_minutes_per_day, daily_focus_goal_minutes, class_buffer_minutes, default_task_minutes, "
     "semester_start (YYYY-MM-DD), employer_name, work_report_categories (list), mirror_web_to_telegram, "

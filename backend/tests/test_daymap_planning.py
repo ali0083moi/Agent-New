@@ -130,6 +130,7 @@ def test_learned_session_length(clock):
 
 # ---------------------------------------------------------------- human nudges
 def test_one_nudge_per_work_session_and_no_end_pings(clock):
+    prefs.set("followup_style", "coach")
     with session() as s:
         t1 = Task(title="پروژه ماشین", estimated_minutes=200)
         t2 = Task(title="خواندن مقاله", estimated_minutes=60)

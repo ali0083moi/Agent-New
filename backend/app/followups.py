@@ -50,6 +50,28 @@ MAX_DELAY = {
 
 _last_rescue_check: datetime | None = None
 
+# only in the "coach" style; the default "reminder" style sends what the user asked for, deadline reminders, the
+# overdue question, leaving / after-class / morning messages — not work-session pings and check-ins they ignore
+COACH_ONLY = {"block_start", "block_end", "idle_checkin", "task_checkin", "rescue", "daily_review"}
+# dropped instead of postponed while the user asked not to be disturbed
+DROP_WHEN_QUIET = COACH_ONLY | {"focus_long", "vocab_review", "habit_reminder"}
+
+
+def coach(p: dict[str, Any]) -> bool:
+    return p.get("followup_style") == "coach"
+
+
+def quiet_until(s: Session, now: datetime) -> datetime | None:
+    """End of the do-not-disturb the user asked for («تا ۱:۳۰ مزاحمم نشو»), if it is still running."""
+    v = prefs.get("quiet_until", s=s)
+    if not v:
+        return None
+    try:
+        until = timeutil.parse_datetime(v)
+    except ValueError:
+        return None
+    return until if until > now else None
+
 
 def _ensure(s: Session, key: str, kind: str, due: datetime, **fields: Any) -> Followup | None:
     existing = s.query(Followup).filter(Followup.dedupe_key == key).first()
@@ -89,7 +111,7 @@ def ensure_task_followups(s: Session, t: Task, p: dict[str, Any], now: datetime,
         if f:
             created.append(f)
     span = t.due_at - (t.created_at or now)
-    if span >= timedelta(days=3):
+    if span >= timedelta(days=3) and coach(p):
         mid = (t.created_at or now) + span / 2
         if mid > now:
             f = _ensure(s, f"checkin:{t.id}:{due_iso}", "task_checkin", mid, **base)
@@ -122,8 +144,10 @@ def generate(s: Session, now: datetime | None = None) -> int:
     n = 0
     rstats = insights.response_stats(s)
 
-    # 0) housekeeping: past blocks nobody worked in -> skipped (+ re-plan); close yesterday's commitments
-    if planner.sweep_missed(s, now) and p.get("auto_replan", True):
+    # 0) housekeeping: tasks whose time is over (the quiz happened) are closed; past blocks nobody worked in ->
+    #    skipped (+ re-plan); close yesterday's commitments
+    retired = planner.retire_expired(s, now)
+    if (planner.sweep_missed(s, now) or retired) and p.get("auto_replan", True):
         planner.plan(s, days=7)
     from . import habits as habits_mod
 
@@ -149,12 +173,14 @@ def generate(s: Session, now: datetime | None = None) -> int:
 
     # 3) planned work: ONE nudge when a work session starts (consecutive blocks = one session), a few a day at
     #    most, and only for sessions worth it. No "block ended" pings — the evening review asks how it went.
-    if p.get("block_nudges", True):
+    if p.get("block_nudges", True) and coach(p):
         n += _session_nudges(s, now, horizon, p, rstats)
 
     # 4) daily brief & review, weekly report
     for day in (now.date(), now.date() + timedelta(days=1)):
         for kind, pref in (("daily_brief", "daily_brief_time"), ("daily_review", "daily_review_time")):
+            if kind in COACH_ONLY and not coach(p):
+                continue
             at = timeutil.at(day, p[pref])
             if at > now - MAX_DELAY[kind] and not _sent_today(s, kind, day) and _ensure(
                 s, f"{kind}:{day.isoformat()}:{p[pref]}", kind, at, payload={"time": p[pref]}
@@ -175,7 +201,8 @@ def generate(s: Session, now: datetime | None = None) -> int:
                 n += 1
 
     # 5) idle check-in during the productive window
-    n += _idle_checkin(s, now, p, rstats)
+    if coach(p):
+        n += _idle_checkin(s, now, p, rstats)
 
     # 6b) habits not done yet today, IELTS vocabulary review
     n += _habit_reminders(s, now, rstats)
@@ -194,7 +221,7 @@ def generate(s: Session, now: datetime | None = None) -> int:
 
     # 7) rescue mode: the workload no longer fits before the deadlines (checked every 10 minutes)
     global _last_rescue_check
-    if p.get("rescue_mode", True) and not is_quiet(now, p) and (
+    if p.get("rescue_mode", True) and coach(p) and not is_quiet(now, p) and (
         _last_rescue_check is None or abs((now - _last_rescue_check).total_seconds()) >= 600
     ):
         _last_rescue_check = now
@@ -442,10 +469,18 @@ def due_now(s: Session, now: datetime | None = None) -> list[Followup]:
     now = now or timeutil.now()
     p = prefs.all_prefs(s)
     out = []
+    mute = quiet_until(s, now)
     rows = s.query(Followup).filter(Followup.status == "pending", Followup.due_at <= now).order_by(Followup.due_at).all()
     for f in rows:
-        if not _still_valid(s, f, now):
+        if not _still_valid(s, f, now) or (f.kind in COACH_ONLY and not coach(p)):
             f.status = "cancelled"
+            continue
+        if mute is not None and f.kind not in ("custom", "leave"):
+            # the user's own reminders and "time to leave" still come; the rest waits (or is dropped)
+            if f.kind in DROP_WHEN_QUIET:
+                f.status = "cancelled"
+            else:
+                f.due_at = mute + timedelta(minutes=2)
             continue
         if f.kind in DEFER_WHILE_BUSY:
             from . import daymap

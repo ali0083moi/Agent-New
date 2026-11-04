@@ -21,6 +21,8 @@ export type ChatMessage = {
     undone?: boolean;
     followup_id?: number;
     snoozed_until?: string;
+    reminder_actions?: { id: string; label: string }[];
+    reminder_done?: string;
     forwarded_from?: string;
     document_name?: string;
   };

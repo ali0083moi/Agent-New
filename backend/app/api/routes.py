@@ -207,6 +207,11 @@ async def _answer_pending(message_id: int, approve: bool) -> dict[str, Any]:
     return {"ok": res["ok"], "text": res["text"]}
 
 
+@router.post("/messages/{message_id}/reminder/{action}")
+def reminder_action(message_id: int, action: str):
+    return {"text": actions.reminder_action(message_id, action)}
+
+
 @router.post("/messages/{message_id}/snooze")
 def snooze_message(message_id: int, minutes: int = 60):
     return {"text": actions.snooze_message(message_id, minutes)}

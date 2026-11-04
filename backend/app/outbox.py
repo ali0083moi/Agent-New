@@ -30,8 +30,11 @@ def buttons_for(message_id: int | None, meta: dict[str, Any] | None) -> list[lis
     qr = meta.get("quick_replies") or []
     for k in range(0, len(qr), 3):
         rows.append([{"text": q, "data": f"qr:{message_id}:{j}"} for j, q in enumerate(qr[k:k + 3], start=k)])
+    ra = [] if meta.get("reminder_done") else (meta.get("reminder_actions") or [])
+    for k in range(0, len(ra), 3):
+        rows.append([{"text": a["label"], "data": f"ra:{message_id}:{a['id']}"} for a in ra[k:k + 3]])
     extra = []
-    if meta.get("followup_id"):
+    if meta.get("followup_id") and not meta.get("reminder_actions"):
         extra.append({"text": "⏰ یک ساعت دیگه", "data": f"sz:{message_id}:60"})
     if meta.get("undoable"):
         extra.append({"text": "↩️ برگردون", "data": f"ud:{message_id}"})

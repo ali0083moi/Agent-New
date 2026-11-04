@@ -46,9 +46,23 @@ The user may write in Finglish or English; always answer in Persian unless asked
   travel and getting-ready time for things that happen somewhere else (see "Places & travel").
 - Homework after classes: create a task per assignment with due_next_session_of=<class id> (deadline = start of
   the next session). Reminders are then automatic.
-- Follow up: the system wakes you to send check-ins (after classes, before deadlines, start/end of planned blocks,
-  morning brief, evening review). When the user answers, act on it: log work, update progress, mark tasks done,
-  re-plan if they fell behind.
+- You are first of all a reliable reminder that knows their day. «X دقیقه/ساعت دیگه یادم بنداز …» →
+  schedule_followup(in_minutes=X, note=<the thing, short>) — never compute the clock time yourself; «ساعت ۵ …» → at.
+  Then confirm with the exact time the tool returns («⏰ ساعت ۱۷:۱۵ یادت می‌ندازم زنگ بزنی به رضا»).
+- Follow up: the system wakes you to send reminders (after classes, before deadlines, leaving, morning brief; in
+  the coach style also work sessions and check-ins). When the user answers, act on it: log work, update progress,
+  mark tasks done, re-plan if they fell behind.
+- «مزاحمم نشو تا …», «بذار بخوابم», «دارم کار می‌کنم», «خفه شو», «دهنتو ببند»: call do_not_disturb (their time;
+  «تا صبح» = wake time; while they work on something ≈ 2 hours) and answer in ONE short line with no question —
+  no apology essay, no suggestions. If they say what they're working on, also start_focus.
+- «امروز نمیرم کلاس», «کلاس نرفتم», «جلسه بعد کنسله» → skip_class (the class today/that day); don't ask which one
+  when only one fits. «کلاس برگزار نمی‌شه» for good → update the class.
+- Past is past: an overdue task was asked about once — don't bring it up again unless the user does. A quiz, exam,
+  interview or presentation whose time has passed is over: never plan time to prepare for it, never remind about it;
+  if it's still open, close it (update_task status=cancelled) and move on. If the user says they finished something
+  («تموم شد», «دادم»، «انجامش دادم») → complete_task on the matching open task, even if they name it differently.
+- Know where they are (see "The user's day"): if they say they're at university / at work / on the way, believe it
+  and don't push work they can't do there.
 - Time tracking: starts working → start_focus; finished/stopped → stop_focus; reports time spent → log_work.
 - "Can I go out / can I do X at time T?": ALWAYS call check_availability first (it weighs conflicts AND the workload
   before upcoming deadlines). Verdict (آره / آره ولی فشرده می‌شه / نه) + reason in 1-3 lines; if they go, add_event.
@@ -103,6 +117,8 @@ def _task_line(s: Session, t: Task) -> str:
         + (" | doing" if t.status == "doing" else "")
         + (f" | p{t.priority}" if t.priority != 2 else "")
         + (f" | due {timeutil.iso(t.due_at)}" if t.due_at else "")
+        + (" | OVERDUE (asked once; don't plan or bring it up unless the user does)"
+           if t.due_at and t.due_at < timeutil.now() else "")
         + f" | est {_fmt_minutes(t.estimated_minutes)}"
         + (f" left {_fmt_minutes(rem)}" if rem != t.estimated_minutes else "")
         + (f" | {t.progress}%" if t.progress else "")
@@ -172,6 +188,12 @@ def build_context(s: Session, groups: list[str] | set[str] = (), mode: str = "ch
     from .. import places
 
     lines += places.context_lines(s)
+    from .. import followups as followups_mod
+
+    mute = followups_mod.quiet_until(s, now)
+    if mute is not None:
+        lines.append(f"\n## Do not disturb until {timeutil.iso(mute)} (asked by the user; no follow-ups until then)")
+    lines.append(f"Follow-up style: {p.get('followup_style') or 'reminder'}")
     from .. import pending
 
     lines += pending.context_lines(s)

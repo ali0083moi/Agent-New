@@ -7,7 +7,7 @@ import logging
 from datetime import timedelta
 from typing import Any
 
-from .. import cal, followups, gamify, habits, ielts, notify, planner, prefs, reports, rescue, stats, timeutil
+from .. import actions, cal, followups, gamify, habits, ielts, notify, planner, prefs, reports, rescue, stats, timeutil
 from ..bus import bus
 from ..db import Followup, Habit, PlannedBlock, RecurringEvent, Task, session
 from . import core
@@ -70,6 +70,17 @@ def build(f: Followup) -> tuple[str, str, list[str]] | None:
                 .all()
             )
             blocks_txt = ", ".join(f"{timeutil.fa_datetime(b.start_at)}" for b in blocks) or "none"
+            if f.kind == "deadline" and not followups.coach(p):
+                hrs = payload.get("hours_before")
+                left = planner.remaining_minutes(s, t)
+                instr = (
+                    f"Deadline reminder (~{hrs}h left) for task {t.id}: {_task_line(s, t)}. Work still needed: about "
+                    f"{left} min. Free time the plan found for it: {blocks_txt}.\n"
+                    "A short reminder, 1-2 lines: what is due when, and in which free window of their day it fits (or "
+                    "that it's tight). No questions about percentages; don't repeat things they already know."
+                )
+                fallback = f"⏰ یادت نره: {_task_line(s, t)}"
+                return instr, fallback, []
             if f.kind == "deadline":
                 hrs = payload.get("hours_before")
                 left = planner.remaining_minutes(s, t)
@@ -88,11 +99,10 @@ def build(f: Followup) -> tuple[str, str, list[str]] | None:
                 )
                 fallback = f"یه سر بزنیم به {_task_line(s, t)} — چقدرش پیش رفته؟"
             else:
-                instr = (
-                    f"The deadline of task {t.id} passed and it's not marked done: {_task_line(s, t)}. "
-                    "Ask what happened: done already (then you'll mark it), or needs a new deadline?"
-                )
-                fallback = f"ددلاین «{t.title}» گذشت. انجامش دادی یا باید یه ددلاین جدید بذاریم؟"
+                # asked once, with buttons; after this the task is not planned or brought up again by itself
+                text = (f"⌛ ددلاین «{t.title}» ({timeutil.fa_datetime(t.due_at)}) گذشت. انجامش دادی؟\n"
+                        "اگه هنوز لازمه بگو تا کی، یا بزن «بذار برای فردا».")
+                return "", text, []
             return instr, fallback, ["انجامش دادم ✅", "هنوز نه", "ددلاین رو جابه‌جا کن"]
 
         if f.kind in ("block_start", "block_end"):
@@ -142,10 +152,12 @@ def build(f: Followup) -> tuple[str, str, list[str]] | None:
             day = cal.agenda(s, now.date(), 1)[0]
             soon = (
                 s.query(Task)
-                .filter(Task.status.in_(["todo", "doing"]), Task.due_at.is_not(None), Task.due_at <= now + timedelta(days=3))
+                .filter(Task.status.in_(["todo", "doing"]), Task.due_at.is_not(None), Task.due_at >= now,
+                        Task.due_at <= now + timedelta(days=3))
                 .order_by(Task.due_at)
                 .all()
             )
+            expired = [x.title for x in planner.recently_expired(s, now)]
             y = stats.productivity(s, now.date() - timedelta(days=1), now.date() - timedelta(days=1))
             hb = [h for h in habits.all_habits(s) if h["period"] == "daily"]
             g = gamify.summary(s)
@@ -158,10 +170,12 @@ def build(f: Followup) -> tuple[str, str, list[str]] | None:
                 "to finish. Don't list work blocks mechanically and never say 'بلوک'. Mention deadlines in the next 3 "
                 "days.\n"
                 f"The day as they'll live it: {daymap.describe(s, now.date())}\n"
-                "Then ask what they "
-                "commit to today (one concrete promise, e.g. '۲ ساعت رایتینگ') so you can record it with add_commitment. "
-                "One short motivating line.\n"
-                f"Today's agenda: {day['items']}\nDue within 3 days: {[_task_line(s, x) for x in soon]}"
+                + ("Then ask what they commit to today (one concrete promise, e.g. '۲ ساعت رایتینگ') so you can record "
+                   "it with add_commitment. One short motivating line.\n" if followups.coach(p) else
+                   "Keep it short (a reminder of the day, not a lecture); no questions at the end.\n")
+                + (f"Over and removed from the list since yesterday (their time passed — never plan or ask about "
+                   f"them again): {expired}\n" if expired else "")
+                + f"Today's agenda: {day['items']}\nDue within 3 days: {[_task_line(s, x) for x in soon]}"
                 f"{plan_txt}\nYesterday productive minutes: {y['total_productive_minutes']} (goal {y['daily_goal_minutes']})"
                 f"\nDaily habits & streaks: {[(h['title'], h['streak']) for h in hb]}"
                 f"\nLevel {g['level']} ({g['title']}), this week's score so far {g['weekly_score']['score']}/100"
@@ -171,6 +185,8 @@ def build(f: Followup) -> tuple[str, str, list[str]] | None:
             if soon:
                 lines.append("ددلاین‌های نزدیک:")
                 lines += [f"- {_task_line(s, x)}" for x in soon]
+            if not followups.coach(p):
+                return instr, "\n".join(lines), []
             lines.append("امروز چه قولی به خودت می‌دی؟ 🤝")
             return instr, "\n".join(lines), ["۲ ساعت کار عمیق", "تموم کردن یه تسک"]
 
@@ -350,9 +366,8 @@ def build(f: Followup) -> tuple[str, str, list[str]] | None:
             return "", text, ["راه افتادم", "امروز نمی‌رم"]
 
         if f.kind == "custom":
-            extra = f" Related task: {_task_line(s, t)}." if t else ""
-            instr = f"Reminder the user (or you) scheduled: «{f.note}».{extra} Deliver it naturally."
-            return instr, f"⏰ یادآوری: {f.note}", []
+            # exactly what the user asked to be reminded of — no model rewording
+            return "", f"⏰ یادآوری: {f.note}", []
     return None
 
 
@@ -377,10 +392,14 @@ async def dispatch(fid: int) -> dict[str, Any] | None:
         _mark(fid, "cancelled")
         return None
     instr, fallback, quick = built
+    meta: dict[str, Any] = {"followup_id": fid, "quick_replies": quick}
+    buttons = actions.actions_for(f.kind, f.task_id is not None)
+    if buttons:
+        meta["reminder_actions"] = buttons
     async with core.lock:
         # an empty instruction means the fixed text is the message (no model call needed)
         text = await core.compose(instr, fallback, strong=f.kind in STRONG_KINDS) if instr else fallback
-        msg = await notify.deliver(text, f.kind, meta={"followup_id": fid, "quick_replies": quick})
+        msg = await notify.deliver(text, f.kind, meta=meta)
     _mark_sent(fid)
     return msg
 
@@ -403,7 +422,7 @@ def _mark_sent(fid: int) -> None:
 STRONG_KINDS = {"weekly_planning"}
 
 # task reminders that fall due together are sent as one message (one model call instead of several)
-BATCHABLE = {"deadline", "task_checkin", "overdue"}
+BATCHABLE = {"deadline", "task_checkin"}
 
 
 async def dispatch_batch(fids: list[int]) -> dict[str, Any] | None:

@@ -21,6 +21,9 @@ DEFAULTS: dict[str, Any] = {
     "daily_review_time": "22:45",
     "weekly_report_day": "thu",
     "weekly_report_time": "18:00",
+    # reminder = a reminder app that knows your day: what you asked for, deadlines, leaving, after class, morning brief
+    # coach = also work-session nudges, idle check-ins, progress check-ins, rescue plans and the evening review
+    "followup_style": "reminder",
     "followup_intensity": "normal",  # low | normal | high
     "idle_checkin_hours": 3,
     "post_class_delay_minutes": 15,
@@ -90,7 +93,8 @@ EARLIER_RECOMMENDED = {
 
 # app state keys (not user preferences)
 STATE_KEYS = {"telegram_chat_id", "telegram_user", "telegram_offset", "pairing_code", "last_user_message_at",
-              "current_session_id", "model_defaults_version", "gcal_last_sync", "mail_state"}
+              "current_session_id", "model_defaults_version", "gcal_last_sync", "mail_state",
+              "quiet_until"}  # do-not-disturb: no follow-ups before this time (only the user's own reminders)
 # secrets: not in DEFAULTS, so they are never returned by the settings API nor settable by the model
 SECRET_KEYS = {"gcal_ics_urls", "ics_token", "gmail_address", "gmail_app_password"}
 

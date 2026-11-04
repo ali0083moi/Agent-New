@@ -71,9 +71,25 @@ GitHub → Actions → Ops → task `evals`, models comma-separated, scenarios o
 2026-11-04: +10 scenarios from the real chats (26 total): `deadline_list` (Jalali list, 23:59), `midterm_fix`,
 `delete_wrong`, `done_fuzzy`, `dnd` («تا ۱:۳۰ مزاحمم نشو»), `quiet_now` («دهنتو ببند دارم … مینویسم»),
 `skip_class`, `project_task`, `wellbeing`, `ask_tonight`. `_clean` now also fails replies that show tool names,
-`{"tool_names"…}` or raw DB errors. `dnd` and `quiet_now` check `followups.due_now`, and no tool can mute follow-ups
-yet, so they are expected to fail until a do-not-disturb feature exists. `skip_class` needs the model to cancel that
-day's post_class follow-up.
+`{"tool_names"…}` or raw DB errors. `dnd` and `quiet_now` check `followups.due_now`.
++2 (28 total): `remind_in` («یک ساعت دیگه یادم بنداز…» → exactly 11:00), `past_quiz` (a quiz that's over is not
+mentioned or planned).
+
+### 5. Reminder-first (2026-11-04, after the user said it felt dumb and noisy)
+- `prefs.followup_style`: `reminder` (default) | `coach`. `followups.COACH_ONLY` (block_start/end, idle_checkin,
+  task_checkin, rescue, daily_review) are neither generated nor sent in `reminder`; tests for them set `coach`.
+- The past is past: `planner.retire_expired` (run in `followups.generate`) closes open tasks whose deadline passed
+  and that are pointless afterwards (`Task.expires`, or a title with کوییز/امتحان/میانترم/ارائه/مصاحبه…; note
+  `planner.EXPIRED_NOTE`). `planner.schedulable_tasks` leaves out overdue tasks unless status=doing, so they are not
+  planned, not in rescue/feasibility, and the morning brief only lists future deadlines. The prompt marks them OVERDUE.
+- Overdue question and the user's own reminders are fixed texts (no model call) with one-tap buttons
+  (`actions.reminder_action`: done / tomorrow / drop / snooze10 / snooze60; Telegram `ra:<msg>:<id>`, web
+  `POST /api/messages/{id}/reminder/{action}`). Overdue is no longer batched.
+- Tools: `schedule_followup(in_minutes=…)` (the server computes the time; live it once said 16:45 for «نیم ساعت
+  دیگه» at 16:00), `do_not_disturb(until|minutes|off)` → state `quiet_until` (`followups.due_now` holds everything
+  but custom/leave; DROP_WHEN_QUIET are cancelled), `skip_class` (cancels that session's post_class / leave).
+- Local tests on the Mac: PyPI wheels can't be downloaded here; `uv pip install --offline` plus packages symlinked
+  into `.venv/borrowed` run 154 tests. The ~19 that need itsdangerous/icalendar/pywebpush/pypdf only run in CI.
 
 ## Model comparison (ops evals, 2026-11-02, 14 scenarios / 40 checks, on the server)
 | model | score | cost | time |
@@ -103,8 +119,8 @@ python -m app.evals --models gemini-3.1-flash-lite,deepseek-v4-flash --scenarios
 ```
 
 ## Open ideas / next steps
-- Real chats reviewed 2026-11-04 (done → scenarios above). Gaps they exposed: a do-not-disturb-until tool
-  (mute follow-ups until a time / while the user works), a "skip today's class" action.
+- Real chats reviewed 2026-11-04 (done → scenarios above). Do-not-disturb, skip class, exact reminders: built (5.).
+- Run the 28 evals on the server with deepseek-v4-flash and look at `dnd`, `quiet_now`, `skip_class`, `remind_in`.
 - Commute time as light-task time (vocab on the metro) — day map already knows the trips and their mode.
 - Per-weekday "light days" from `study_profile` could lower the daily focus cap on those days.
 - Quick-reply chips for questions with options (beyond yes/no).

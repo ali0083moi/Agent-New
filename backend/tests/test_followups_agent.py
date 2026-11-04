@@ -151,6 +151,7 @@ def test_quiet_hours_postpone(clock):
 
 
 def test_block_nudges_and_focus(clock, fake_llm):
+    prefs.set("followup_style", "coach")
     prefs.set("daily_brief_time", "23:00")
     with session() as s:
         t = Task(title="مطالعه فصل ۳", estimated_minutes=90)
@@ -186,6 +187,7 @@ def test_block_nudges_and_focus(clock, fake_llm):
 
 
 def test_idle_checkin(clock, fake_llm):
+    prefs.set("followup_style", "coach")
     prefs.set("idle_checkin_hours", 2)
     with session() as s:
         s.add(Message(session_id=sid(), role="user", content="سلام", channel="web", created_at=datetime(2026, 10, 19, 7, 0)))

@@ -169,6 +169,16 @@ export default function Settings({ theme, setTheme }: { theme: string; setTheme:
       <GmailCard />
 
       <Card title="پیگیری‌ها" icon={<Zap className="size-4 text-amber-500" />}>
+        <Row
+          label="سبک پیگیری"
+          hint="یادآور: فقط چیزهایی که خواستی، ددلاین‌ها، وقت راه افتادن، بعد از کلاس و برنامه صبح. مربی: به‌علاوه «وقت شروع کاره»، احوال‌پرسی، پیگیری پیشرفت، حالت نجات و جمع‌بندی شب"
+        >
+          <Segmented
+            value={String(p.followup_style ?? "reminder")}
+            onChange={(v) => save("followup_style", v)}
+            options={[{ value: "reminder", label: "یادآور" }, { value: "coach", label: "مربی" }]}
+          />
+        </Row>
         <Row label="شدت پیگیری" hint="تعداد یادآوری‌ها و احوال‌پرسی‌ها">
           <Segmented
             value={String(p.followup_intensity ?? "normal")}

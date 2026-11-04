@@ -81,6 +81,17 @@ function MessageTools({ m }: { m: ChatMessage }) {
       setBusy(null);
     }
   };
+  const remind = async (action: string) => {
+    setBusy(action);
+    try {
+      const r = await api.post<{ text: string }>(`/api/messages/${m.id}/reminder/${action}`);
+      toast(r.text, "success");
+    } catch (e) {
+      toast((e as Error).message, "error");
+    } finally {
+      setBusy(null);
+    }
+  };
   const btn = "inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] text-slate-500 transition hover:bg-slate-100 hover:text-slate-800 dark:hover:bg-slate-800 dark:hover:text-slate-200";
   return (
     <div className="flex flex-wrap items-center gap-0.5 opacity-80">
@@ -93,7 +104,14 @@ function MessageTools({ m }: { m: ChatMessage }) {
         </button>
       )}
       {m.meta?.undone && <span className="px-2 text-[11px] text-slate-400">↩️ برگردانده شد</span>}
-      {m.meta?.followup_id && !m.meta?.snoozed_until && (
+      {!m.meta?.reminder_done &&
+        m.meta?.reminder_actions?.map((a) => (
+          <button key={a.id} className={btn} onClick={() => remind(a.id)} disabled={busy !== null}>
+            {busy === a.id && <Loader2 className="size-3 animate-spin" />} {a.label}
+          </button>
+        ))}
+      {m.meta?.reminder_done && <span className="px-2 text-[11px] text-slate-400">{m.meta.reminder_done}</span>}
+      {m.meta?.followup_id && !m.meta?.reminder_actions && !m.meta?.snoozed_until && (
         <button className={btn} onClick={snooze} disabled={busy !== null} title="یک ساعت دیگر دوباره یادآوری کن">
           <AlarmClock className="size-3" /> یک ساعت دیگه
         </button>

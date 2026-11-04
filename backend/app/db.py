@@ -239,6 +239,8 @@ class Task(Base):
     parent_id: Mapped[int | None] = mapped_column(ForeignKey("tasks.id", ondelete="CASCADE"), nullable=True, index=True)
     project_id: Mapped[int | None] = mapped_column(ForeignKey("projects.id", ondelete="SET NULL"), nullable=True, index=True)
     energy: Mapped[str] = mapped_column(String(8), default="normal")  # high (deep work) | normal | low
+    # pointless once the deadline passed (studying for a quiz, an exam, an interview); None = guess from the title
+    expires: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     source: Mapped[str] = mapped_column(String(32), default="chat")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)

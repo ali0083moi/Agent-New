@@ -285,6 +285,7 @@ def test_add_task_uses_how_long_similar_tasks_took(clock):
 
 # ---------------------------------------------------------------- fewer, cheaper proactive messages
 def test_rescue_at_most_once_a_day(clock):
+    prefs.set("followup_style", "coach")
     with session() as s:
         for i in range(3):
             s.add(Task(title=f"پروژه بزرگ {i}", estimated_minutes=900, due_at=clock.value + timedelta(hours=10 + i)))

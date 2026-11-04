@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Any
@@ -73,15 +74,56 @@ def open_tasks(s: Session) -> list[Task]:
     return s.query(Task).filter(Task.status.in_(["todo", "doing"])).all()
 
 
-def schedulable_tasks(s: Session) -> list[Task]:
-    """Open tasks the planner works on: leaf tasks (a project with open subtasks is planned via its subtasks)."""
+def schedulable_tasks(s: Session, now: datetime | None = None) -> list[Task]:
+    """Open tasks the planner works on: leaf tasks (a project with open subtasks is planned via its subtasks).
+    A task whose deadline passed is left out unless the user is on it (status doing): the overdue reminder asks
+    once what to do with it, and it's not planned — or nagged about — again until it gets a new deadline."""
+    now = now or timeutil.now()
     parents = _parents_with_open_children(s)
     tasks = [t for t in open_tasks(s) if t.id not in parents]
     by_id = {t.id: t for t in s.query(Task).filter(Task.id.in_({t.parent_id for t in tasks if t.parent_id})).all()}
     for t in tasks:  # subtasks without their own deadline inherit the project's
         if t.due_at is None and t.parent_id and by_id.get(t.parent_id) is not None:
             t.__dict__["_effective_due"] = by_id[t.parent_id].due_at
-    return tasks
+    return [t for t in tasks if not (is_overdue(t, now) and t.status != "doing")]
+
+
+# things that are pointless once their time passed: preparing for a quiz / an exam / an interview / a talk
+EXPIRING = re.compile(r"(کو[یئ]?یز|امتحان|آزمون|میان ?‌?ترم|پایان ?‌?ترم|ارائه|مصاحبه|مناظره|quiz|exam|midterm|"
+                      r"final|interview|presentation)", re.IGNORECASE)
+EXPIRED_NOTE = "⌛ زمانش گذشت — خودکار از لیست برداشته شد"
+
+
+def is_overdue(t: Task, now: datetime | None = None) -> bool:
+    due = effective_due(t)
+    return due is not None and due < (now or timeutil.now())
+
+
+def expires_at_due(t: Task) -> bool:
+    if t.expires is not None:
+        return bool(t.expires)
+    return bool(EXPIRING.search(t.title or ""))
+
+
+def retire_expired(s: Session, now: datetime | None = None) -> list[Task]:
+    """Close open tasks that make no sense anymore (the quiz they were preparing for is over).
+    Their reminders are cancelled with them (follow-ups only go out for open tasks)."""
+    now = now or timeutil.now()
+    out = []
+    for t in open_tasks(s):
+        if t.due_at is not None and t.due_at <= now and expires_at_due(t):
+            t.status = "cancelled"
+            t.notes = (t.notes + "\n" if t.notes else "") + EXPIRED_NOTE
+            out.append(t)
+    if out:
+        s.flush()
+    return out
+
+
+def recently_expired(s: Session, now: datetime | None = None, hours: int = 24) -> list[Task]:
+    now = now or timeutil.now()
+    return (s.query(Task).filter(Task.status == "cancelled", Task.updated_at >= now - timedelta(hours=hours),
+                                 Task.notes.contains(EXPIRED_NOTE)).all())
 
 
 def effective_due(t: Task) -> datetime | None:
@@ -200,7 +242,7 @@ class Feasibility:
 
 def feasibility(s: Session, extra_busy: list[Interval] | None = None, start: datetime | None = None) -> Feasibility:
     now = round_up(start or timeutil.now())
-    tasks = sorted([t for t in schedulable_tasks(s) if effective_due(t)], key=_task_key)
+    tasks = sorted([t for t in schedulable_tasks(s, now) if effective_due(t)], key=_task_key)
     horizon = max([effective_due(t) for t in tasks], default=now) + timedelta(days=1)
     horizon = max(horizon, now + timedelta(days=7))
     days = free_days(s, now, horizon, extra_busy)
@@ -224,7 +266,7 @@ def feasibility(s: Session, extra_busy: list[Interval] | None = None, start: dat
         res.min_slack = slack if res.min_slack is None else min(res.min_slack, slack)
         if slack < 0:
             res.at_risk.append(info)
-    res.total_required = sum(remaining_minutes(s, t) for t in schedulable_tasks(s))
+    res.total_required = sum(remaining_minutes(s, t) for t in schedulable_tasks(s, now))
     return res
 
 
@@ -262,7 +304,7 @@ def plan(s: Session, days: int = 7, start: datetime | None = None, commit: bool 
     if not peaks & window:
         peaks = set()  # peaks outside the productive window can't be used: plain EDF
     profile = insights.study_profile(s)
-    tasks = sorted(schedulable_tasks(s), key=_task_key)
+    tasks = sorted(schedulable_tasks(s, now), key=_task_key)
     if commit:
         # blocks of tasks that became projects (have subtasks) or are no longer open
         leaf_ids = {t.id for t in tasks}

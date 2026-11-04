@@ -353,6 +353,16 @@ def _seed_car_project() -> None:
         s.add(Project(name="tahami supercars", aliases=["پروژه ماشین"], category="work"))
 
 
+def _seed_past_quiz() -> None:
+    """The quiz was yesterday; studying for it is over (the housekeeping closes it like on the server)."""
+    with session() as s:
+        s.add(Task(title="آمادگی کوییز مدار", category="university", estimated_minutes=120,
+                   due_at=datetime(2026, 10, 18, 10, 30)))
+        s.add(Task(title="تمرین اتوماتا", category="university", estimated_minutes=60, due_at=datetime(2026, 10, 20, 23, 59)))
+    with session() as s:
+        followups.generate(s, FIXED_NOW)
+
+
 def _due_kinds(at: datetime) -> list[str]:
     with session() as s:
         return [f.kind for f in followups.due_now(s, at)]
@@ -473,6 +483,31 @@ def _ask_tonight_checks(run: Run) -> list[Check]:
     ]
 
 
+def _remind_in_checks(run: Run) -> list[Check]:
+    with session() as s:
+        fs = s.query(Followup).filter(Followup.kind == "custom").all()
+    reply = run.replies[-1]
+    return [
+        ("یادآوری دقیقاً ساعت ۱۱:۰۰", len(fs) == 1 and abs((fs[0].due_at - datetime(2026, 10, 19, 11, 0)).total_seconds()) <= 60),
+        ("متن یادآوری درباره زنگ زدن به رضاست", len(fs) == 1 and "رضا" in fs[0].note),
+        ("ساعت را در جواب گفت", bool(re.search(r"(۱۱|11)", reply))),
+        ("پاسخ فارسی و تمیز", _persian(reply) and _clean(reply)),
+    ]
+
+
+def _past_quiz_checks(run: Run) -> list[Check]:
+    reply = run.replies[-1]
+    with session() as s:
+        quiz = s.query(Task).filter(Task.title.contains("کوییز")).one()
+        planned = {b.task_id for b in s.query(PlannedBlock).all()}
+    return [
+        ("کوییز گذشته در جواب نیامد", "کوییز" not in reply and "کوئیز" not in reply),
+        ("کار واقعی پیش رو (تمرین اتوماتا) را گفت", "اتوماتا" in reply),
+        ("برای کوییز گذشته وقت گذاشته نشد", quiz.id not in planned and quiz.status != "todo"),
+        ("پاسخ فارسی و تمیز", _persian(reply) and _clean(reply)),
+    ]
+
+
 SCENARIOS = [
     Scenario("homework", "تکلیف بعد از کلاس", ["تازه از کلاس زبان اومدم، برای جلسه بعد یه رایتینگ تسک ۲ درباره تکنولوژی داد"],
              _homework_checks, _seed_ielts_class),
@@ -521,6 +556,8 @@ SCENARIOS = [
         "تا آخر امشب برای قسمت گیم پروژه ماشین باید یه داکیومنت دربیارم و به کارفرما تحویل بدم"],
         _project_task_checks, _seed_car_project),
     Scenario("wellbeing", "احوال‌پرسی، نه پیگیری کار", ["از صبح کم حالمو پرسیدی"], _wellbeing_checks, _seed_busy_week),
+    Scenario("remind_in", "یک ساعت دیگه یادم بنداز", ["یک ساعت دیگه یادم بنداز زنگ بزنم به رضا"], _remind_in_checks),
+    Scenario("past_quiz", "کوییزی که گذشته", ["برنامه امروزم چیه؟"], _past_quiz_checks, _seed_past_quiz),
     Scenario("ask_tonight", "شب ازم بپرس", ["یه ددلاین داده که گفت روی cw هست ولی نرفتم چک کنم، شب ازم بپرس بهت بگم"],
              _ask_tonight_checks),
 ]
